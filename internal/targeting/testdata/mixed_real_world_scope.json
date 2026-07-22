@@ -1,0 +1,22 @@
+{
+  "target": {
+    "scope": {
+      "include": [
+        {"enabled": true, "protocol": "http", "host": "^.*\\.dev\\.life360\\.com$", "port": "^80$", "file": "^/.*"},
+        {"enabled": true, "protocol": "https", "host": "^.*\\.dev\\.life360\\.com$", "port": "^443$", "file": "^/.*"},
+        {"enabled": true, "protocol": "http", "host": "^api\\.life360\\.com$", "port": "^80$", "file": "^/.*"},
+        {"enabled": true, "protocol": "https", "host": "^api\\.life360\\.com$", "port": "^443$", "file": "^/.*"},
+        {"enabled": true, "protocol": "https", "host": "^www\\.life360\\.com$", "port": "^443$", "file": "^/.*"},
+        {"enabled": true, "protocol": "http", "host": "^tile\\.com$", "port": "^80$", "file": "^/.*"},
+        {"enabled": true, "protocol": "https", "host": "^tile\\.com$", "port": "^443$", "file": "^/.*"},
+        {"enabled": true, "protocol": "https", "host": "^backend\\.jiobit\\.com$", "port": "^443$", "file": "^/.*"},
+        {"enabled": true, "protocol": "https", "host": "^api\\.nativo\\.com$", "port": "^443$", "file": "^/.*"}
+      ],
+      "exclude": [
+        {"enabled": true, "protocol": "http", "host": "^.*\\.tile\\.com$", "port": "^80$", "file": "^/.*"},
+        {"enabled": true, "protocol": "https", "host": "^.*\\.tile\\.com$", "port": "^443$", "file": "^/.*"},
+        {"enabled": true, "protocol": "https", "host": "^snipeit\\.corp\\.tile\\.com$", "port": "^443$", "file": "^/.*"}
+      ]
+    }
+  }
+}

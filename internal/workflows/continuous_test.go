@@ -1,0 +1,59 @@
+package workflows
+
+import (
+	"context"
+	"encoding/json"
+	"testing"
+
+	"github.com/tobiasGuta/Reconductor/internal/capability"
+	"github.com/tobiasGuta/Reconductor/internal/domain"
+	"github.com/tobiasGuta/Reconductor/internal/policy"
+	platformscope "github.com/tobiasGuta/Reconductor/internal/scope"
+	"github.com/tobiasGuta/Reconductor/internal/targeting"
+	"github.com/tobiasGuta/Reconductor/internal/workflow"
+)
+
+type e2eCap struct{ name string }
+
+func (c e2eCap) Manifest() capability.Manifest {
+	return capability.Manifest{Name: c.name, Version: "1", Risk: map[bool]policy.Risk{true: policy.Moderate, false: policy.Low}[c.name == "scan.nuclei"], ApprovalRequired: c.name == "scan.nuclei", Idempotent: true, RetrySafe: true}
+}
+func (c e2eCap) Validate(context.Context, capability.Request) error { return nil }
+func (c e2eCap) Execute(_ context.Context, r capability.Request) (capability.Result, error) {
+	outputs := map[string]string{"discover.subdomains": `{"lines":["api.example.test"],"authorized_urls":["https://api.example.test/"]}`, "targeting.prepare": `{"urls":["https://api.example.test/"],"port_targets":["https://api.example.test/"]}`, "resolve.dns": `{"lines":["api.example.test"]}`, "scan.ports": `{"lines":["api.example.test:443"]}`, "probe.http": `{"lines":["{\"url\":\"https://api.example.test\",\"status_code\":200}"]}`, "compare.assets": `{"crawl_targets":["https://api.example.test"],"scan_targets":["https://api.example.test"],"changes":[{"kind":"new"}]}`, "crawl.web": `{"lines":["https://api.example.test/openapi.json"]}`, "discover.archive_urls": `{"lines":["https://api.example.test/v1/users"]}`, "classify.endpoint": `{"endpoints":[],"interesting_endpoints":[]}`, "scan.nuclei": `{"lines":[]}`, "report.changes": `{"changes":[{"kind":"new"}]}`}
+	return capability.Result{Action: domain.ActionResult{RequestID: r.Action.ID, Status: "succeeded", Summary: c.name, Output: json.RawMessage(outputs[c.name])}}, nil
+}
+
+func TestContinuousWebReconEndToEndStateMachine(t *testing.T) {
+	registry := capability.NewRegistry()
+	for _, name := range []string{"discover.subdomains", "targeting.prepare", "resolve.dns", "scan.ports", "probe.http", "compare.assets", "crawl.web", "discover.archive_urls", "classify.endpoint", "scan.nuclei", "report.changes"} {
+		if err := registry.Register(e2eCap{name}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sc, err := platformscope.Compile([]platformscope.Rule{{Protocol: `^https$`, Host: `^api\.example\.test$`, Port: `^443$`, File: `^/.*`, Enabled: true}, {Protocol: `^https$`, Host: `^.*\.example\.test$`, Port: `^443$`, File: `^/.*`, Enabled: true}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := targeting.Plan(sc, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := ContinuousWebRecon(plan, false)
+	engine := workflow.Engine{Registry: registry, Executor: registry, Policy: policy.Policy{AllowedCapabilities: registry.Names()}, Scope: sc, Approval: func(context.Context, workflow.Step, policy.Risk) (bool, error) { return true, nil }}
+	state, err := engine.Run(context.Background(), definition, nil, domain.Task{ID: domain.NewID(), WorkflowDefinitionID: definition.ID, RequestedBy: "test"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Run.Status != domain.RunCompleted {
+		t.Fatalf("status=%s", state.Run.Status)
+	}
+	if len(state.Steps) != 11 {
+		t.Fatalf("steps=%d", len(state.Steps))
+	}
+	for id, step := range state.Steps {
+		if step.Run.Status != domain.StepSucceeded {
+			t.Fatalf("step %s status=%s", id, step.Run.Status)
+		}
+	}
+}

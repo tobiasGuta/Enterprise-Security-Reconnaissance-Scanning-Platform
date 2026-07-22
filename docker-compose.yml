@@ -1,0 +1,63 @@
+services:
+  postgres:
+    image: postgres:15.13-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-platform}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-platform_local_only}
+      POSTGRES_DB: ${POSTGRES_DB:-security_platform}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4.5-alpine
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-platform_local_only}"]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-platform_local_only}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-platform}:${POSTGRES_PASSWORD:-platform_local_only}@postgres:5432/${POSTGRES_DB:-security_platform}?sslmode=disable
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-platform_local_only}
+      WORKER_POOL_SIZE: ${WORKER_POOL_SIZE:-4}
+      NUCLEI_RATE_LIMIT: ${NUCLEI_RATE_LIMIT:-50}
+      NUCLEI_HOST_CONCURRENCY: ${NUCLEI_HOST_CONCURRENCY:-10}
+      NUCLEI_TEMPLATE_CONCURRENCY: ${NUCLEI_TEMPLATE_CONCURRENCY:-10}
+      NUCLEI_HEADLESS_CONCURRENCY: ${NUCLEI_HEADLESS_CONCURRENCY:-2}
+      NUCLEI_SEVERITY: ${NUCLEI_SEVERITY:-low,medium,high,critical}
+      NUCLEI_INCLUDE_TAGS: ${NUCLEI_INCLUDE_TAGS:-cve,exposure,misconfig}
+      NUCLEI_EXCLUDE_TAGS: ${NUCLEI_EXCLUDE_TAGS:-dos,fuzz,bruteforce,intrusive}
+      NUCLEI_TEMPLATE_DIR: /opt/nuclei-templates
+      ARTIFACT_ROOT: /data/artifacts
+    volumes:
+      - artifacts:/data/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  artifacts:

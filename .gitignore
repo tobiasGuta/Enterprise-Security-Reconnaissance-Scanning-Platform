@@ -1,0 +1,69 @@
+# Compiled binaries and executables
+*_bin
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+dashboard_bin
+worker_bin
+
+# Local compiled binaries
+/main
+/aggregator
+/dashboard
+/platform_bin
+/aggregator_bin
+/main_bin
+/worker_bin
+
+# Worker subdirectory binaries
+/worker/main
+/worker/worker
+/worker/worker_bin
+
+# Tooling/Build outputs
+bin/
+dist/
+
+# Dependency directories (only needed if vendoring, but good to ignore)
+vendor/
+
+# IDEs/Editors
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.project
+.classpath
+.settings/
+
+# OS-specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Diagnostic/Log files
+*.log
+
+# Sensitive environment configuration files
+.env
+.cache/
+artifacts/
+state/
+
+# Local program scope exports may contain sensitive target data.
+/scope/
+
+# Generated program-specific target plans
+/*-scope-plan.json
+/*-workflow-plan.json
