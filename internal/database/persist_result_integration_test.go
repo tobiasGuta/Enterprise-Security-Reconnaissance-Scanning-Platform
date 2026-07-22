@@ -11,7 +11,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
+	"github.com/tobiasGuta/Reconductor/internal/policy"
 	"github.com/tobiasGuta/Reconductor/internal/workflow"
 )
 
@@ -85,7 +87,8 @@ func TestPostgresPersistsFailedExecutionLineage(t *testing.T) {
 	exitCode := 1
 	completed := now.Add(time.Second)
 	tool := &domain.ToolRun{ID: toolID, StepRunID: stepID, Capability: "resolve.dns", Provider: "dnsx", ToolVersion: "test", SanitizedArguments: json.RawMessage(`{"stdin_bytes":19}`), ExecutionEnvironment: json.RawMessage(`{"kind":"local-process","shell":false}`), StartedAt: now, CompletedAt: &completed, ExitCode: &exitCode, StderrArtifactID: &artifactID}
-	artifact := domain.Artifact{ID: artifactID, TaskID: taskID, WorkflowRunID: runID, StepRunID: stepID, ToolRunID: toolID, Type: "raw-provider-output", ContentType: "text/plain", Size: 24, SHA256: strings.Repeat("a", 64), StorageLocation: "synthetic://stderr.txt", CreatedAt: completed, RedactionState: "redacted"}
+	expires := now.Add(-time.Minute)
+	artifact := domain.Artifact{ID: artifactID, TaskID: taskID, WorkflowRunID: runID, StepRunID: stepID, ToolRunID: toolID, Type: "raw-provider-output", ContentType: "text/plain", Size: 24, SHA256: strings.Repeat("a", 64), StorageLocation: "synthetic://stderr.txt", CreatedAt: completed, ExpiresAt: &expires, RedactionState: "redacted"}
 	step := domain.StepRun{ID: stepID, WorkflowRunID: runID, Capability: "resolve.dns", Status: domain.StepFailed, Output: json.RawMessage(`{"lines":[],"authorized":[],"filtered":[]}`), ErrorClassification: "provider_error", ErrorDetails: "exit status 1: fake DNS failure", CompletedAt: &completed}
 	action := domain.ActionResult{RequestID: domain.NewID(), Status: "failed", Summary: "dnsx execution failed", Output: step.Output, Error: &domain.StructuredError{Classification: "provider_error", Message: step.ErrorDetails}}
 	if err := store.PersistResult(ctx, programID, step, tool, []domain.Artifact{artifact}, action); err != nil {
@@ -114,6 +117,30 @@ func TestPostgresPersistsFailedExecutionLineage(t *testing.T) {
 	}
 	if storedTask != taskID || storedRun != runID || storedStep != stepID || storedTool != toolID {
 		t.Fatalf("artifact lineage mismatch: task=%s run=%s step=%s tool=%s", storedTask, storedRun, storedStep, storedTool)
+	}
+	if err := store.RecordPolicyDecision(ctx, capability.PolicyDecisionRecord{ProgramID: programID, Action: domain.ActionRequest{TaskID: taskID, WorkflowRunID: runID, StepRunID: stepID, Capability: "resolve.dns", RequestedBy: "integration-test"}, Provider: "dnsx", PolicyID: "restricted", Phase: "execution", Evaluation: policy.Evaluation{Decision: policy.Deny, Reason: "synthetic denial"}}); err != nil {
+		t.Fatal(err)
+	}
+	var policyEvents int
+	if err := store.Pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE step_run_id=$1 AND event_type='policy_denied'`, stepID).Scan(&policyEvents); err != nil || policyEvents != 1 {
+		t.Fatalf("policy audit count=%d err=%v", policyEvents, err)
+	}
+	expired, err := store.ExpiredArtifacts(ctx, 10)
+	if err != nil || len(expired) != 1 || expired[0].ID != artifactID {
+		t.Fatalf("expired=%#v err=%v", expired, err)
+	}
+	if err := store.DeleteArtifact(ctx, artifactID); err != nil {
+		t.Fatal(err)
+	}
+	var artifactRows, expiryEvents int
+	if err := store.Pool.QueryRow(ctx, `SELECT count(*) FROM artifacts WHERE id=$1`, artifactID).Scan(&artifactRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE step_run_id=$1 AND event_type='artifact_expired'`, stepID).Scan(&expiryEvents); err != nil {
+		t.Fatal(err)
+	}
+	if artifactRows != 0 || expiryEvents != 1 {
+		t.Fatalf("artifact rows=%d expiry audits=%d", artifactRows, expiryEvents)
 	}
 
 	state.Steps["dns"].Run.Status = domain.StepRunning

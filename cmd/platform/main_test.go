@@ -8,9 +8,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tobiasGuta/Reconductor/internal/config"
+	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/providers"
+	"github.com/tobiasGuta/Reconductor/internal/workflow"
 )
 
 func TestScopePlanCLIProducesJSONWithoutRuntimeConfiguration(t *testing.T) {
@@ -97,6 +100,33 @@ func TestConsoleListenAddressRequiresLoopback(t *testing.T) {
 		if err := requireLoopbackAddress(address); err == nil {
 			t.Fatalf("non-loopback or invalid address %q accepted", address)
 		}
+	}
+}
+
+type cancelledTaskReader struct{}
+
+func (cancelledTaskReader) GetTask(context.Context, domain.ID) (domain.Task, error) {
+	return domain.Task{Status: domain.TaskCancelled}, nil
+}
+
+func TestTaskCancellationReachesWorkflowControls(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	controls := &workflow.Controls{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		watchTaskControlsInterval(ctx, cancelledTaskReader{}, domain.NewID(), controls, time.Millisecond)
+	}()
+	select {
+	case <-controls.Done():
+	case <-time.After(time.Second):
+		t.Fatal("cancelled task did not signal workflow controls")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("task watcher did not stop after cancellation")
 	}
 }
 

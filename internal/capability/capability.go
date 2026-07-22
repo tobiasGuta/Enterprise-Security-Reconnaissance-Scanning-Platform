@@ -12,27 +12,45 @@ import (
 )
 
 type Manifest struct {
-	Name                  string          `json:"name"`
-	Description           string          `json:"description"`
-	Version               string          `json:"version"`
-	Risk                  policy.Risk     `json:"risk"`
-	InputSchema           json.RawMessage `json:"input_schema"`
-	OutputSchema          json.RawMessage `json:"output_schema"`
-	RequiredScopeType     string          `json:"required_scope_type"`
-	ApprovalRequired      bool            `json:"approval_required"`
-	RetrySafe             bool            `json:"retry_safe"`
-	Idempotent            bool            `json:"idempotent"`
-	SupportedProviders    []string        `json:"supported_providers"`
-	ProducedArtifactTypes []string        `json:"produced_artifact_types"`
-	RequiredSecrets       []string        `json:"required_secrets"`
-	DefaultTimeout        time.Duration   `json:"default_timeout"`
+	Name                  string              `json:"name"`
+	Description           string              `json:"description"`
+	Version               string              `json:"version"`
+	Risk                  policy.Risk         `json:"risk"`
+	InputSchema           json.RawMessage     `json:"input_schema"`
+	OutputSchema          json.RawMessage     `json:"output_schema"`
+	RequiredScopeType     string              `json:"required_scope_type"`
+	ApprovalRequired      bool                `json:"approval_required"`
+	RetrySafe             bool                `json:"retry_safe"`
+	Idempotent            bool                `json:"idempotent"`
+	SupportedProviders    []string            `json:"supported_providers"`
+	ProducedArtifactTypes []string            `json:"produced_artifact_types"`
+	RequiredSecrets       []string            `json:"required_secrets"`
+	PolicyRequirements    policy.Requirements `json:"policy_requirements"`
+	DefaultTimeout        time.Duration       `json:"default_timeout"`
 }
 type Request struct {
-	Action   domain.ActionRequest `json:"action"`
-	Provider string               `json:"provider"`
-	Approved bool                 `json:"approved"`
-	Policy   policy.Policy        `json:"policy"`
-	Scope    Scope                `json:"scope"`
+	Action           domain.ActionRequest   `json:"action"`
+	ProgramID        domain.ID              `json:"program_id"`
+	Provider         string                 `json:"provider"`
+	Approved         bool                   `json:"approved"`
+	Policy           policy.Policy          `json:"policy"`
+	Scope            Scope                  `json:"scope"`
+	PolicyPhase      string                 `json:"-"`
+	DecisionRecorder PolicyDecisionRecorder `json:"-"`
+}
+
+type PolicyDecisionRecord struct {
+	ProgramID    domain.ID            `json:"program_id"`
+	Action       domain.ActionRequest `json:"action"`
+	Provider     string               `json:"provider"`
+	PolicyID     string               `json:"policy_id"`
+	Phase        string               `json:"phase"`
+	Requirements policy.Requirements  `json:"requirements"`
+	Evaluation   policy.Evaluation    `json:"evaluation"`
+}
+
+type PolicyDecisionRecorder interface {
+	RecordPolicyDecision(context.Context, PolicyDecisionRecord) error
 }
 type Result struct {
 	Action    domain.ActionResult `json:"action"`
@@ -47,7 +65,10 @@ type Capability interface {
 	Execute(context.Context, Request) (Result, error)
 }
 type DefinitionValidator interface{ ValidateDefinition(json.RawMessage) error }
-type Registry struct{ items map[string]Capability }
+type Registry struct {
+	items map[string]Capability
+	now   func() time.Time
+}
 
 type Multi struct {
 	manifest        Manifest
@@ -66,13 +87,19 @@ func NewMulti(defaultProvider string, providers map[string]Capability) (*Multi, 
 	m := base.Manifest()
 	m.SupportedProviders = nil
 	for name, p := range providers {
-		if p.Manifest().Name != m.Name {
-			return nil, fmt.Errorf("provider %s implements %s, expected %s", name, p.Manifest().Name, m.Name)
+		providerManifest := p.Manifest()
+		if providerManifest.Name != m.Name {
+			return nil, fmt.Errorf("provider %s implements %s, expected %s", name, providerManifest.Name, m.Name)
 		}
+		m.PolicyRequirements = mergeRequirements(m.PolicyRequirements, providerManifest.PolicyRequirements)
 		m.SupportedProviders = append(m.SupportedProviders, name)
 	}
 	sort.Strings(m.SupportedProviders)
 	return &Multi{manifest: m, defaultProvider: defaultProvider, providers: providers}, nil
+}
+
+func mergeRequirements(a, b policy.Requirements) policy.Requirements {
+	return policy.Requirements{Authentication: a.Authentication || b.Authentication, DirectoryFuzzing: a.DirectoryFuzzing || b.DirectoryFuzzing, CrossOrigin: a.CrossOrigin || b.CrossOrigin, IntrusiveChecks: a.IntrusiveChecks || b.IntrusiveChecks}
 }
 func (m *Multi) Manifest() Manifest { return m.manifest }
 func (m *Multi) provider(name string) (Capability, error) {
@@ -110,7 +137,7 @@ func (m *Multi) ValidateDefinition(raw json.RawMessage) error {
 	return nil
 }
 
-func NewRegistry() *Registry { return &Registry{items: map[string]Capability{}} }
+func NewRegistry() *Registry { return &Registry{items: map[string]Capability{}, now: time.Now} }
 func (r *Registry) Register(c Capability) error {
 	m := c.Manifest()
 	if m.Name == "" || m.Version == "" {
@@ -132,18 +159,50 @@ func (r *Registry) Names() []string {
 	return out
 }
 func (r *Registry) Execute(ctx context.Context, req Request) (Result, error) {
-	c, ok := r.Get(req.Action.Capability)
-	if !ok {
-		return Result{}, fmt.Errorf("unknown capability %q", req.Action.Capability)
-	}
-	eval := policy.Evaluate(req.Policy, c.Manifest().Name, c.Manifest().Risk, req.Approved)
-	if eval.Decision != policy.Allow {
-		return Result{}, fmt.Errorf("policy %s: %s", eval.Decision, eval.Reason)
+	c, err := r.authorize(ctx, req)
+	if err != nil {
+		return Result{}, err
 	}
 	if err := c.Validate(ctx, req); err != nil {
 		return Result{}, err
 	}
 	return c.Execute(ctx, req)
+}
+
+// Validate authorizes and validates an action without executing its provider.
+func (r *Registry) Validate(ctx context.Context, req Request) error {
+	c, err := r.authorize(ctx, req)
+	if err != nil {
+		return err
+	}
+	return c.Validate(ctx, req)
+}
+
+func (r *Registry) authorize(ctx context.Context, req Request) (Capability, error) {
+	c, ok := r.Get(req.Action.Capability)
+	if !ok {
+		return nil, fmt.Errorf("unknown capability %q", req.Action.Capability)
+	}
+	manifest := c.Manifest()
+	now := time.Now
+	if r.now != nil {
+		now = r.now
+	}
+	eval := policy.EvaluateAt(req.Policy, manifest.Name, manifest.Risk, req.Approved, manifest.PolicyRequirements, req.Action.Input, now().UTC())
+	phase := req.PolicyPhase
+	if phase == "" {
+		phase = "execution"
+	}
+	if req.DecisionRecorder != nil {
+		record := PolicyDecisionRecord{ProgramID: req.ProgramID, Action: req.Action, Provider: req.Provider, PolicyID: req.Policy.ID, Phase: phase, Requirements: manifest.PolicyRequirements, Evaluation: eval}
+		if err := req.DecisionRecorder.RecordPolicyDecision(ctx, record); err != nil {
+			return nil, fmt.Errorf("persist policy decision: %w", err)
+		}
+	}
+	if eval.Decision != policy.Allow {
+		return nil, fmt.Errorf("policy %s: %s", eval.Decision, eval.Reason)
+	}
+	return c, nil
 }
 func (r *Registry) ValidateDefinitionInput(name string, raw json.RawMessage) error {
 	c, ok := r.Get(name)

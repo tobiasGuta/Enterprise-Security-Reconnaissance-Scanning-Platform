@@ -4,6 +4,21 @@ Risk levels are `passive`, `low`, `moderate`, `high`, and `forbidden`. Passive/l
 
 Policies can restrict capabilities, HTTP methods, authentication, headless mode, directory fuzzing, template tags, payload size, redirects, cross-origin behavior, intrusive checks, rate/concurrency, scan windows, and retention. The current CLI constructs a conservative runtime policy from centralized configuration.
 
+Every registered capability declares trusted policy requirements in its manifest. The registry evaluates those declarations at dispatch and again immediately before execution; workflow input cannot downgrade them. Authentication, directory fuzzing, cross-origin access, and intrusive checks default to denied. A denied action is audited and provider validation or execution is never reached. Failure to persist a configured policy audit also fails closed.
+
+Scan windows are UTC, start-inclusive, and end-exclusive. Accepted forms are `HH:MM-HH:MM UTC` for a daily window and `Mon HH:MM-HH:MM UTC` for a weekly window. Overnight windows such as `Mon 22:00-02:00 UTC` are supported. An empty list is unrestricted; a malformed configured window denies execution.
+
+| Policy property | Authoritative enforcement point | Denial evidence |
+| --- | --- | --- |
+| `ScanWindows` | capability registry at dispatch and execution | `policy_denied` audit with UTC-window reason |
+| `AuthenticationUsage` | trusted capability manifest requirements | `policy_denied` before provider validation |
+| `DirectoryFuzzing` | trusted capability manifest requirements | `policy_denied` before provider validation |
+| `CrossOrigin` | trusted capability manifest requirements | `policy_denied` before provider validation |
+| `IntrusiveChecks` | trusted capability manifest requirements | `policy_denied` before provider validation |
+| `ArtifactRetention` | artifact creation, database expiry, and retention collector | `artifact_retention_applied` and `artifact_expired` audits |
+
+`POLICY_ARTIFACT_RETENTION` defaults to `720h`. Set it to `0s` only when indefinite retention is explicitly intended. Existing artifacts from before the expiry migration retain a null expiry and are not retroactively deleted.
+
 Approval records link a request, task, action, risk, reason, decision maker, decision time, and optional expiration. Policy is evaluated before dispatch and again inside the worker immediately before execution.
 
 Redirect scope is evaluated on both the original and destination URL. A permitted source never makes an out-of-scope redirect destination permissible.

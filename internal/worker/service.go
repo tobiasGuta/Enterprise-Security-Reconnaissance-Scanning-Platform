@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/tobiasGuta/Reconductor/internal/artifact"
+	"github.com/tobiasGuta/Reconductor/internal/budget"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/queue"
@@ -28,6 +29,10 @@ type Service struct {
 	PoolSize                int
 	ReadBlock, LeaseTimeout time.Duration
 	Logger                  *slog.Logger
+	Budget                  budget.Limiter
+	PolicyAuditor           capability.PolicyDecisionRecorder
+	Retention               artifact.RetentionStore
+	RetentionEvery          time.Duration
 }
 
 func (s *Service) Run(ctx context.Context) error {
@@ -36,6 +41,12 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	if s.Logger == nil {
 		s.Logger = slog.Default()
+	}
+	if s.RetentionEvery <= 0 {
+		s.RetentionEvery = time.Minute
+	}
+	if err := s.purgeExpired(ctx); err != nil {
+		return err
 	}
 	if err := s.Queue.EnsureGroup(ctx); err != nil {
 		return err
@@ -54,15 +65,21 @@ func (s *Service) Run(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
+		retryTicker := time.NewTicker(time.Second)
+		retentionTicker := time.NewTicker(s.RetentionEvery)
+		defer retryTicker.Stop()
+		defer retentionTicker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			case <-retryTicker.C:
 				if _, err := s.Queue.PumpRetries(ctx, 100); err != nil {
 					s.Logger.Error("retry pump failed", "error", err)
+				}
+			case <-retentionTicker.C:
+				if err := s.purgeExpired(ctx); err != nil {
+					s.Logger.Error("artifact retention purge failed", "error", err)
 				}
 			}
 		}
@@ -140,7 +157,32 @@ func (s *Service) handle(ctx context.Context, d queue.Delivery) error {
 	if err != nil {
 		return s.Queue.Fail(ctx, d.MessageID, d.Job, "invalid_scope: "+err.Error(), false)
 	}
-	result, runErr := s.Registry.Execute(ctx, capability.Request{Action: d.Job.Action, Provider: d.Job.Provider, Approved: d.Job.Approved, Policy: d.Job.Policy, Scope: sc})
+	provider := d.Job.Provider
+	if provider == "" {
+		if implementation, ok := s.Registry.Get(d.Job.Action.Capability); ok {
+			manifest := implementation.Manifest()
+			if len(manifest.SupportedProviders) > 0 {
+				provider = manifest.SupportedProviders[0]
+			}
+		}
+	}
+	if provider == "" {
+		provider = d.Job.Action.Capability
+	}
+	if s.Budget != nil {
+		release, acquireErr := s.Budget.Acquire(ctx, budget.Request{ProgramID: d.Job.ProgramID, Provider: provider, Hosts: budget.HostsFromInput(d.Job.Action.Input)})
+		if acquireErr != nil {
+			return acquireErr
+		}
+		defer release()
+	}
+	auditor := s.PolicyAuditor
+	if auditor == nil {
+		if recorder, ok := s.Results.(capability.PolicyDecisionRecorder); ok {
+			auditor = recorder
+		}
+	}
+	result, runErr := s.Registry.Execute(ctx, capability.Request{Action: d.Job.Action, ProgramID: d.Job.ProgramID, Provider: d.Job.Provider, Approved: d.Job.Approved, Policy: d.Job.Policy, Scope: sc, PolicyPhase: "execution", DecisionRecorder: auditor})
 	if runErr != nil {
 		retryable := result.Action.Error != nil && result.Action.Error.Retryable
 		return s.Queue.Fail(ctx, d.MessageID, d.Job, runErr.Error(), retryable)
@@ -152,7 +194,7 @@ func (s *Service) handle(ctx context.Context, d queue.Delivery) error {
 	}
 	var artifacts []domain.Artifact
 	if len(result.Action.Output) > 0 {
-		a, err := s.Artifacts.Put(ctx, artifact.PutRequest{ProgramID: d.Job.ProgramID, TaskID: d.Job.Action.TaskID, WorkflowRunID: d.Job.Action.WorkflowRunID, StepRunID: d.Job.Action.StepRunID, ToolRunID: tool.ID, Type: "normalized-result", ContentType: "application/json", Name: "result.json", Data: result.Action.Output})
+		a, err := s.Artifacts.Put(ctx, artifact.PutRequest{ProgramID: d.Job.ProgramID, TaskID: d.Job.Action.TaskID, WorkflowRunID: d.Job.Action.WorkflowRunID, StepRunID: d.Job.Action.StepRunID, ToolRunID: tool.ID, Type: "normalized-result", ContentType: "application/json", Name: "result.json", Retention: d.Job.Policy.ArtifactRetention, Data: result.Action.Output})
 		if err != nil {
 			return s.Queue.Fail(ctx, d.MessageID, d.Job, "artifact: "+err.Error(), true)
 		}
@@ -167,4 +209,16 @@ func (s *Service) handle(ctx context.Context, d queue.Delivery) error {
 		return err
 	}
 	return s.Queue.Ack(ctx, d.MessageID, result.Action)
+}
+
+func (s *Service) purgeExpired(ctx context.Context) error {
+	if s.Retention == nil {
+		return nil
+	}
+	deleter, ok := s.Artifacts.(artifact.Deleter)
+	if !ok {
+		return fmt.Errorf("artifact storage does not support retention deletion")
+	}
+	_, err := artifact.PurgeExpired(ctx, s.Retention, deleter, 1000)
+	return err
 }

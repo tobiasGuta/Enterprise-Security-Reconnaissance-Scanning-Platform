@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tobiasGuta/Reconductor/internal/budget"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
@@ -68,15 +69,38 @@ type ApprovalFunc func(context.Context, Step, policy.Risk) (bool, error)
 type Controls struct {
 	mu                sync.RWMutex
 	paused, cancelled bool
+	cancelledCh       chan struct{}
 }
 
 func (c *Controls) Pause()  { c.mu.Lock(); defer c.mu.Unlock(); c.paused = true }
 func (c *Controls) Resume() { c.mu.Lock(); defer c.mu.Unlock(); c.paused = false }
-func (c *Controls) Cancel() { c.mu.Lock(); defer c.mu.Unlock(); c.cancelled = true }
+func (c *Controls) Cancel() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cancelled {
+		return
+	}
+	c.cancelled = true
+	if c.cancelledCh == nil {
+		c.cancelledCh = make(chan struct{})
+	}
+	close(c.cancelledCh)
+}
 func (c *Controls) state() (bool, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.paused, c.cancelled
+}
+func (c *Controls) Done() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cancelledCh == nil {
+		c.cancelledCh = make(chan struct{})
+		if c.cancelled {
+			close(c.cancelledCh)
+		}
+	}
+	return c.cancelledCh
 }
 
 type Engine struct {
@@ -86,6 +110,10 @@ type Engine struct {
 	Approval  ApprovalFunc
 	Policy    policy.Policy
 	Scope     capability.Scope
+	Budget    budget.Limiter
+	// MaxParallel is the maximum number of ready steps in one deterministic
+	// execution wave. Zero preserves the legacy single-step behavior.
+	MaxParallel int
 }
 
 func Validate(d Definition, r *capability.Registry) error {
@@ -161,7 +189,40 @@ func Validate(d Definition, r *capability.Registry) error {
 			return err
 		}
 	}
+	for _, step := range d.Steps {
+		for _, binding := range step.Bindings {
+			source := strings.Split(binding, ".")[0]
+			if !transitivelyDependsOn(step.ID, source, byID) {
+				return fmt.Errorf("step %s binding source %s must be a dependency", step.ID, source)
+			}
+		}
+		if step.Condition != "" {
+			_, reference, _ := strings.Cut(step.Condition, ":")
+			source := strings.Split(reference, ".")[0]
+			if !transitivelyDependsOn(step.ID, source, byID) {
+				return fmt.Errorf("step %s condition source %s must be a dependency", step.ID, source)
+			}
+		}
+	}
 	return nil
+}
+
+func transitivelyDependsOn(stepID, sourceID string, definitions map[string]Step) bool {
+	seen := map[string]bool{}
+	var contains func(string) bool
+	contains = func(id string) bool {
+		if seen[id] {
+			return false
+		}
+		seen[id] = true
+		for _, dependency := range definitions[id].DependsOn {
+			if dependency == sourceID || contains(dependency) {
+				return true
+			}
+		}
+		return false
+	}
+	return contains(stepID)
 }
 func (e *Engine) Run(ctx context.Context, d Definition, state *State, task domain.Task, controls *Controls) (*State, error) {
 	if err := Validate(d, e.Registry); err != nil {
@@ -173,134 +234,330 @@ func (e *Engine) Run(ctx context.Context, d Definition, state *State, task domai
 	if controls == nil {
 		controls = &Controls{}
 	}
+	runCtx, cancelRun := context.WithCancel(ctx)
+	watchDone := make(chan struct{})
+	go func() {
+		select {
+		case <-controls.Done():
+			cancelRun()
+		case <-ctx.Done():
+			cancelRun()
+		case <-watchDone:
+		}
+	}()
+	defer func() {
+		close(watchDone)
+		cancelRun()
+	}()
+
 	now := time.Now().UTC()
+	resuming := state != nil
 	if state == nil {
 		state = &State{Run: domain.WorkflowRun{ID: domain.NewID(), TaskID: task.ID, WorkflowDefinitionID: d.ID, WorkflowVersion: d.Version, Status: domain.RunRunning, StartedAt: &now, TriggerSource: task.RequestedBy, Summary: json.RawMessage(`{}`)}, Steps: map[string]*StepState{}}
 		state.Events = append(state.Events, Event{now, "workflow_started", "", "workflow execution started"})
 	} else {
 		state.Run.Status = domain.RunRunning
+		state.Run.CompletedAt = nil
 		state.Events = append(state.Events, Event{now, "workflow_resumed", "", "workflow execution resumed"})
 	}
-	if err := e.save(ctx, state); err != nil {
+	if err := e.save(runCtx, state); err != nil {
 		return state, err
 	}
 	ordered := topological(d)
-	for _, step := range ordered {
+	rank := make(map[string]int, len(ordered))
+	finished := make(map[string]bool, len(ordered))
+	blockedApprovals := make(map[string]bool)
+	for index, step := range ordered {
+		rank[step.ID] = index
+		if existing := state.Steps[step.ID]; existing != nil && existing.Run.Status == domain.StepSucceeded && !step.RerunOnInputChange {
+			finished[step.ID] = true
+			if resuming {
+				e.event(state, "step_resumed", step.ID, "previous successful result retained")
+			}
+		}
+	}
+	maxParallel := e.MaxParallel
+	if maxParallel < 1 {
+		maxParallel = 1
+	}
+
+	for len(finished) < len(ordered) {
 		paused, cancelled := controls.state()
 		if cancelled {
-			return e.terminal(ctx, state, domain.RunCancelled, "workflow_cancelled")
+			return e.terminal(runCtx, state, domain.RunCancelled, "workflow_cancelled")
+		}
+		if ctx.Err() != nil {
+			terminal, terminalErr := e.terminal(runCtx, state, domain.RunCancelled, "workflow_cancelled")
+			return terminal, errors.Join(ctx.Err(), terminalErr)
 		}
 		if paused {
 			state.Run.Status = domain.RunPaused
-			e.event(state, "workflow_paused", step.ID, "pause requested")
-			_ = e.save(ctx, state)
+			e.event(state, "workflow_paused", "", "pause requested")
+			_ = e.save(runCtx, state)
 			return state, nil
 		}
-		input, err := resolveInput(step, state)
-		if err != nil {
-			return e.fail(ctx, state, step.ID, "input_resolution", err)
-		}
-		hash := inputHash(input)
-		if existing := state.Steps[step.ID]; existing != nil && existing.Run.Status == domain.StepSucceeded && (!step.RerunOnInputChange || existing.InputHash == hash) {
-			e.event(state, "step_resumed", step.ID, "previous successful result retained")
-			continue
-		}
-		if !dependenciesSucceeded(step, state) {
-			return e.fail(ctx, state, step.ID, "dependency", errors.New("dependency did not succeed"))
-		}
-		if !condition(step.Condition, state) {
-			state.Steps[step.ID] = transitionStep(state, step, input, hash, domain.StepSkipped)
-			e.event(state, "step_skipped", step.ID, "condition was false")
-			if err := e.save(ctx, state); err != nil {
-				return state, err
+
+		ready := make([]Step, 0, len(ordered))
+		for _, step := range ordered {
+			if finished[step.ID] || blockedApprovals[step.ID] {
+				continue
 			}
-			continue
+			if dependenciesSucceeded(step, state) {
+				ready = append(ready, step)
+			}
 		}
-		capabilityImpl, _ := e.Registry.Get(step.Capability)
-		approved := false
-		if step.ApprovalRequired || capabilityImpl.Manifest().ApprovalRequired {
-			if e.Approval == nil {
-				ss := transitionStep(state, step, input, hash, domain.StepAwaitingApproval)
-				ss.Run.ApprovalState = "pending"
-				state.Steps[step.ID] = ss
+		if len(ready) == 0 {
+			if len(blockedApprovals) > 0 {
 				state.Run.Status = domain.RunPaused
-				e.event(state, "approval_required", step.ID, "approval is required before execution")
-				_ = e.save(ctx, state)
+				e.event(state, "workflow_paused", "", "approval is required before execution can continue")
+				_ = e.save(runCtx, state)
 				return state, nil
 			}
-			approved, err = e.Approval(ctx, step, capabilityImpl.Manifest().Risk)
+			return e.fail(runCtx, state, "", "dependency", errors.New("workflow has no runnable steps"))
+		}
+
+		plans := make([]stepPlan, 0, maxParallel)
+		stateChanged := false
+		for _, step := range ready {
+			if len(plans) >= maxParallel {
+				break
+			}
+			input, err := resolveInput(step, state)
 			if err != nil {
-				return e.fail(ctx, state, step.ID, "approval", err)
+				return e.fail(runCtx, state, step.ID, "input_resolution", err)
 			}
-			if !approved {
-				return e.fail(ctx, state, step.ID, "approval_rejected", errors.New("approval rejected"))
+			hash := inputHash(input)
+			if existing := state.Steps[step.ID]; existing != nil && existing.Run.Status == domain.StepSucceeded && (!step.RerunOnInputChange || existing.InputHash == hash) {
+				finished[step.ID] = true
+				e.event(state, "step_resumed", step.ID, "previous successful result retained")
+				stateChanged = true
+				continue
+			}
+			if !condition(step.Condition, state) {
+				ss := transitionStep(state, step, input, hash, domain.StepSkipped)
+				done := time.Now().UTC()
+				ss.Run.CompletedAt = &done
+				state.Steps[step.ID] = ss
+				finished[step.ID] = true
+				e.event(state, "step_skipped", step.ID, "condition was false")
+				stateChanged = true
+				continue
+			}
+			capabilityImpl, _ := e.Registry.Get(step.Capability)
+			manifest := capabilityImpl.Manifest()
+			approved := false
+			if step.ApprovalRequired || manifest.ApprovalRequired {
+				if e.Approval == nil {
+					ss := transitionStep(state, step, input, hash, domain.StepAwaitingApproval)
+					ss.Run.ApprovalState = "pending"
+					state.Steps[step.ID] = ss
+					blockedApprovals[step.ID] = true
+					e.event(state, "approval_required", step.ID, "approval is required before execution")
+					stateChanged = true
+					continue
+				}
+				approved, err = e.Approval(runCtx, step, manifest.Risk)
+				if err != nil {
+					return e.fail(runCtx, state, step.ID, "approval", err)
+				}
+				if !approved {
+					return e.fail(runCtx, state, step.ID, "approval_rejected", errors.New("approval rejected"))
+				}
+			}
+			ss := transitionStep(state, step, input, hash, domain.StepRunning)
+			started := time.Now().UTC()
+			ss.Run.StartedAt = &started
+			ss.Run.ApprovalState = map[bool]string{true: "approved", false: "not_required"}[approved]
+			state.Steps[step.ID] = ss
+			e.event(state, "step_started", step.ID, "capability execution started")
+			stateChanged = true
+			provider := step.Provider
+			if provider == "" && len(manifest.SupportedProviders) > 0 {
+				provider = manifest.SupportedProviders[0]
+			}
+			if provider == "" {
+				provider = step.Capability
+			}
+			plans = append(plans, stepPlan{Definition: step, State: *ss, Input: input, Approved: approved, Provider: provider})
+		}
+		if stateChanged {
+			if err := e.save(runCtx, state); err != nil {
+				return state, err
 			}
 		}
-		ss := transitionStep(state, step, input, hash, domain.StepRunning)
-		ss.Run.ApprovalState = map[bool]string{true: "approved", false: "not_required"}[approved]
-		state.Steps[step.ID] = ss
-		e.event(state, "step_started", step.ID, "capability execution started")
-		if err := e.save(ctx, state); err != nil {
-			return state, err
+		if len(plans) == 0 {
+			continue
 		}
-		max := step.Retry.MaxAttempts
-		if max < 1 {
-			max = 1
+		for index := range plans {
+			plans[index].ParallelShare = len(plans)
 		}
-		var result capability.Result
-		for attempt := 1; attempt <= max; attempt++ {
-			ss.Run.AttemptCount = attempt
-			action := domain.ActionRequest{ID: domain.NewID(), TaskID: task.ID, WorkflowRunID: state.Run.ID, StepRunID: ss.Run.ID, RequestedBy: "workflow", Capability: step.Capability, Reason: "deterministic workflow step " + step.ID, Input: input, IdempotencyKey: ss.Run.IdempotencyKey}
-			runCtx := ctx
-			cancel := func() {}
-			if step.Timeout > 0 {
-				runCtx, cancel = context.WithTimeout(ctx, step.Timeout)
+
+		outcomes := e.executeWave(runCtx, task, state.Run.ID, plans)
+		sort.Slice(outcomes, func(i, j int) bool { return rank[outcomes[i].Definition.ID] < rank[outcomes[j].Definition.ID] })
+		var primaryFailure *stepOutcome
+		for index := range outcomes {
+			outcome := &outcomes[index]
+			ss := outcome.State
+			state.Steps[outcome.Definition.ID] = &ss
+			if outcome.Err == nil {
+				ss.Run.Status = domain.StepSucceeded
+				ss.Run.Output = outcome.Result.Action.Output
+				state.Steps[outcome.Definition.ID] = &ss
+				finished[outcome.Definition.ID] = true
+				if outcome.Definition.Capability == "report.changes" && len(outcome.Result.Action.Output) > 0 {
+					state.Run.Summary = append(json.RawMessage(nil), outcome.Result.Action.Output...)
+				}
+				e.event(state, "step_succeeded", outcome.Definition.ID, outcome.Result.Action.Summary)
+			} else if outcome.PrimaryFailure {
+				ss.Run.Status = domain.StepFailed
+				ss.Run.ErrorClassification = executionClassification(outcome.Result, outcome.Err)
+				ss.Run.ErrorDetails = outcome.Err.Error()
+				state.Steps[outcome.Definition.ID] = &ss
+				e.event(state, "step_failed", outcome.Definition.ID, outcome.Err.Error())
+				if primaryFailure == nil {
+					primaryFailure = outcome
+				}
+			} else {
+				ss.Run.Status = domain.StepCancelled
+				ss.Run.ErrorClassification = "cancelled"
+				ss.Run.ErrorDetails = outcome.Err.Error()
+				state.Steps[outcome.Definition.ID] = &ss
+				e.event(state, "step_cancelled", outcome.Definition.ID, "cancelled because the workflow wave stopped")
 			}
-			result, err = e.Executor.Execute(runCtx, capability.Request{Action: action, Provider: step.Provider, Approved: approved, Policy: e.Policy, Scope: e.Scope})
-			cancel()
-			if err == nil {
-				break
-			}
-			if result.Action.Error == nil || !result.Action.Error.Retryable || attempt == max {
-				break
-			}
-			delay := step.Retry.BaseDelay
-			if delay <= 0 {
-				delay = time.Second
-			}
-			timer := time.NewTimer(delay * time.Duration(1<<(attempt-1)))
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return e.fail(ctx, state, step.ID, "cancelled", ctx.Err())
-			case <-timer.C:
+			if err := e.save(runCtx, state); err != nil {
+				return state, err
 			}
 		}
-		done := time.Now().UTC()
-		ss.Run.CompletedAt = &done
-		if err != nil {
-			ss.Run.Status = domain.StepFailed
-			ss.Run.ErrorClassification = "execution"
-			ss.Run.ErrorDetails = err.Error()
-			e.event(state, "step_failed", step.ID, err.Error())
-			_ = e.save(ctx, state)
-			return e.fail(ctx, state, step.ID, "execution", err)
+		_, cancelled = controls.state()
+		if cancelled || ctx.Err() != nil {
+			terminal, terminalErr := e.terminal(runCtx, state, domain.RunCancelled, "workflow_cancelled")
+			if ctx.Err() != nil {
+				return terminal, errors.Join(ctx.Err(), terminalErr)
+			}
+			return terminal, terminalErr
 		}
-		ss.Run.Status = domain.StepSucceeded
-		ss.Run.Output = result.Action.Output
-		if step.Capability == "report.changes" && len(result.Action.Output) > 0 {
-			state.Run.Summary = append(json.RawMessage(nil), result.Action.Output...)
-		}
-		e.event(state, "step_succeeded", step.ID, result.Action.Summary)
-		if err := e.save(ctx, state); err != nil {
-			return state, err
+		if primaryFailure != nil {
+			return e.fail(runCtx, state, primaryFailure.Definition.ID, executionClassification(primaryFailure.Result, primaryFailure.Err), primaryFailure.Err)
 		}
 	}
-	return e.terminal(ctx, state, domain.RunCompleted, "workflow_completed")
+	return e.terminal(runCtx, state, domain.RunCompleted, "workflow_completed")
 }
+
+type stepPlan struct {
+	Definition    Step
+	State         StepState
+	Input         json.RawMessage
+	Approved      bool
+	Provider      string
+	ParallelShare int
+}
+
+type stepOutcome struct {
+	Definition     Step
+	State          StepState
+	Result         capability.Result
+	Err            error
+	PrimaryFailure bool
+}
+
+func (e *Engine) executeWave(ctx context.Context, task domain.Task, runID domain.ID, plans []stepPlan) []stepOutcome {
+	outcomes := make(chan stepOutcome, len(plans))
+	var group sync.WaitGroup
+	for _, plan := range plans {
+		plan := plan
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			outcome := e.executeStep(ctx, task, runID, plan)
+			outcome.PrimaryFailure = outcome.Err != nil && ctx.Err() == nil
+			outcomes <- outcome
+		}()
+	}
+	group.Wait()
+	close(outcomes)
+	result := make([]stepOutcome, 0, len(plans))
+	for outcome := range outcomes {
+		result = append(result, outcome)
+	}
+	return result
+}
+
+func (e *Engine) executeStep(ctx context.Context, task domain.Task, runID domain.ID, plan stepPlan) stepOutcome {
+	outcome := stepOutcome{Definition: plan.Definition, State: plan.State}
+	if e.Budget != nil {
+		release, err := e.Budget.Acquire(ctx, budget.Request{ProgramID: task.ProgramID, Provider: plan.Provider, Hosts: budget.HostsFromInput(plan.Input)})
+		if err != nil {
+			outcome.Err = err
+			completeStep(&outcome.State)
+			return outcome
+		}
+		defer release()
+	}
+	maxAttempts := plan.Definition.Retry.MaxAttempts
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		outcome.State.Run.AttemptCount = attempt
+		action := domain.ActionRequest{ID: domain.NewID(), TaskID: task.ID, WorkflowRunID: runID, StepRunID: outcome.State.Run.ID, RequestedBy: "workflow", Capability: plan.Definition.Capability, Reason: "deterministic workflow step " + plan.Definition.ID, Input: plan.Input, IdempotencyKey: outcome.State.Run.IdempotencyKey}
+		attemptCtx := ctx
+		cancelAttempt := func() {}
+		if plan.Definition.Timeout > 0 {
+			attemptCtx, cancelAttempt = context.WithTimeout(ctx, plan.Definition.Timeout)
+		}
+		outcome.Result, outcome.Err = e.Executor.Execute(attemptCtx, capability.Request{Action: action, Provider: plan.Definition.Provider, Approved: plan.Approved, Policy: policy.ParallelShare(e.Policy, plan.ParallelShare), Scope: e.Scope})
+		cancelAttempt()
+		if outcome.Err == nil {
+			break
+		}
+		if outcome.Result.Action.Error == nil || !outcome.Result.Action.Error.Retryable || attempt == maxAttempts {
+			break
+		}
+		delay := plan.Definition.Retry.BaseDelay
+		if delay <= 0 {
+			delay = time.Second
+		}
+		timer := time.NewTimer(delay * time.Duration(1<<(attempt-1)))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			outcome.Err = ctx.Err()
+			completeStep(&outcome.State)
+			return outcome
+		case <-timer.C:
+		}
+	}
+	completeStep(&outcome.State)
+	return outcome
+}
+
+func completeStep(state *StepState) {
+	done := time.Now().UTC()
+	state.Run.CompletedAt = &done
+}
+
+func executionClassification(result capability.Result, err error) string {
+	if result.Action.Error != nil && result.Action.Error.Classification != "" {
+		return result.Action.Error.Classification
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "cancelled"
+	}
+	return "execution"
+}
+
 func (e *Engine) save(ctx context.Context, s *State) error {
 	if e.Persister != nil {
-		return e.Persister.Save(ctx, s)
+		persistCtx := ctx
+		cancel := func() {}
+		if ctx.Err() != nil {
+			persistCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		}
+		defer cancel()
+		return e.Persister.Save(persistCtx, s)
 	}
 	return nil
 }

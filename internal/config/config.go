@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/tobiasGuta/Reconductor/internal/policy"
 )
 
 type Config struct {
@@ -75,11 +77,19 @@ type ArtifactStorage struct {
 	Root   string
 }
 type Policy struct {
-	DefaultRateLimit   int
-	DefaultConcurrency int
-	MaxPayloadBytes    int64
-	AllowedMethods     []string
-	FollowRedirects    bool
+	DefaultRateLimit           int
+	DefaultConcurrency         int
+	DefaultProviderConcurrency int
+	DefaultHostConcurrency     int
+	MaxPayloadBytes            int64
+	AllowedMethods             []string
+	FollowRedirects            bool
+	ScanWindows                []string
+	AuthenticationUsage        bool
+	DirectoryFuzzing           bool
+	CrossOrigin                bool
+	IntrusiveChecks            bool
+	ArtifactRetention          time.Duration
 }
 type Logging struct {
 	Level       string
@@ -105,18 +115,18 @@ func loadWith(get Lookup, requireDatabase bool) (Config, error) {
 		Worker:          Worker{ConsumerGroup: value(get, "WORKER_CONSUMER_GROUP", "capability-workers"), ConsumerName: value(get, "WORKER_CONSUMER_NAME", hostname()), PoolSize: integer(get, "WORKER_POOL_SIZE", 4), LeaseTimeout: duration(get, "WORKER_LEASE_TIMEOUT", 2*time.Minute), ReadBlock: duration(get, "WORKER_READ_BLOCK", 5*time.Second), MaxRetries: integer(get, "WORKER_MAX_RETRIES", 3), RetryBase: duration(get, "WORKER_RETRY_BASE", 2*time.Second)},
 		Nuclei:          Nuclei{RateLimit: integer(get, "NUCLEI_RATE_LIMIT", 50), HostConcurrency: integer(get, "NUCLEI_HOST_CONCURRENCY", 10), TemplateConcurrency: integer(get, "NUCLEI_TEMPLATE_CONCURRENCY", 10), HeadlessConcurrency: integer(get, "NUCLEI_HEADLESS_CONCURRENCY", 2), Timeout: duration(get, "NUCLEI_TIMEOUT", 10*time.Minute), Severity: csv(get, "NUCLEI_SEVERITY", "low,medium,high,critical"), IncludeTags: csv(get, "NUCLEI_INCLUDE_TAGS", "cve,exposure,misconfig"), ExcludeTags: csv(get, "NUCLEI_EXCLUDE_TAGS", "dos,fuzz,bruteforce,intrusive"), TemplateDirectory: get("NUCLEI_TEMPLATE_DIR"), UpdateTemplates: boolean(get, "NUCLEI_UPDATE_TEMPLATES", false)},
 		ArtifactStorage: ArtifactStorage{Driver: value(get, "ARTIFACT_DRIVER", "local"), Root: value(get, "ARTIFACT_ROOT", "artifacts")},
-		Policy:          Policy{DefaultRateLimit: integer(get, "POLICY_RATE_LIMIT", 50), DefaultConcurrency: integer(get, "POLICY_CONCURRENCY", 10), MaxPayloadBytes: int64(integer(get, "POLICY_MAX_PAYLOAD_BYTES", 1048576)), AllowedMethods: csv(get, "POLICY_ALLOWED_METHODS", "GET,HEAD,OPTIONS"), FollowRedirects: boolean(get, "POLICY_FOLLOW_REDIRECTS", false)},
+		Policy:          Policy{DefaultRateLimit: integer(get, "POLICY_RATE_LIMIT", 50), DefaultConcurrency: integer(get, "POLICY_CONCURRENCY", 10), DefaultProviderConcurrency: integer(get, "POLICY_PROVIDER_CONCURRENCY", 2), DefaultHostConcurrency: integer(get, "POLICY_HOST_CONCURRENCY", 1), MaxPayloadBytes: int64(integer(get, "POLICY_MAX_PAYLOAD_BYTES", 1048576)), AllowedMethods: csv(get, "POLICY_ALLOWED_METHODS", "GET,HEAD,OPTIONS"), FollowRedirects: boolean(get, "POLICY_FOLLOW_REDIRECTS", false), ScanWindows: csv(get, "POLICY_SCAN_WINDOWS", ""), AuthenticationUsage: boolean(get, "POLICY_AUTHENTICATION_USAGE", false), DirectoryFuzzing: boolean(get, "POLICY_DIRECTORY_FUZZING", false), CrossOrigin: boolean(get, "POLICY_CROSS_ORIGIN", false), IntrusiveChecks: boolean(get, "POLICY_INTRUSIVE_CHECKS", false), ArtifactRetention: duration(get, "POLICY_ARTIFACT_RETENTION", 720*time.Hour)},
 		Logging:         Logging{Level: value(get, "LOG_LEVEL", "info"), SecretNames: csv(get, "REDACT_SECRET_NAMES", "")},
 	}
 	var parseErrs []error
-	for _, key := range []string{"REDIS_TLS", "RECON_HEADLESS", "RECON_PROVIDER_UPDATE", "NUCLEI_UPDATE_TEMPLATES", "POLICY_FOLLOW_REDIRECTS"} {
+	for _, key := range []string{"REDIS_TLS", "RECON_HEADLESS", "RECON_PROVIDER_UPDATE", "NUCLEI_UPDATE_TEMPLATES", "POLICY_FOLLOW_REDIRECTS", "POLICY_AUTHENTICATION_USAGE", "POLICY_DIRECTORY_FUZZING", "POLICY_CROSS_ORIGIN", "POLICY_INTRUSIVE_CHECKS"} {
 		if v := strings.TrimSpace(get(key)); v != "" {
 			if _, err := strconv.ParseBool(v); err != nil {
 				parseErrs = append(parseErrs, fmt.Errorf("%s must be true or false", key))
 			}
 		}
 	}
-	for _, key := range []string{"RECON_TIMEOUT", "WORKER_LEASE_TIMEOUT", "WORKER_READ_BLOCK", "WORKER_RETRY_BASE", "NUCLEI_TIMEOUT"} {
+	for _, key := range []string{"RECON_TIMEOUT", "WORKER_LEASE_TIMEOUT", "WORKER_READ_BLOCK", "WORKER_RETRY_BASE", "NUCLEI_TIMEOUT", "POLICY_ARTIFACT_RETENTION"} {
 		if v := strings.TrimSpace(get(key)); v != "" {
 			if _, err := time.ParseDuration(v); err != nil {
 				parseErrs = append(parseErrs, fmt.Errorf("%s must be a Go duration", key))
@@ -162,11 +172,19 @@ func (c Config) validate(requireDatabase bool) error {
 	if strings.TrimSpace(c.ArtifactStorage.Root) == "" {
 		errs = append(errs, errors.New("ARTIFACT_ROOT is required"))
 	}
-	if c.Policy.DefaultRateLimit < 1 || c.Policy.DefaultConcurrency < 1 || c.Policy.MaxPayloadBytes < 1 {
+	if c.Policy.DefaultRateLimit < 1 || c.Policy.DefaultConcurrency < 1 || c.Policy.DefaultProviderConcurrency < 1 || c.Policy.DefaultHostConcurrency < 1 || c.Policy.MaxPayloadBytes < 1 {
 		errs = append(errs, errors.New("policy rate limit, concurrency, and maximum payload size must be positive"))
 	}
 	if len(c.Policy.AllowedMethods) == 0 {
 		errs = append(errs, errors.New("at least one policy HTTP method is required"))
+	}
+	if c.Policy.ArtifactRetention < 0 {
+		errs = append(errs, errors.New("POLICY_ARTIFACT_RETENTION must be non-negative"))
+	}
+	for _, window := range c.Policy.ScanWindows {
+		if evaluation := policy.EvaluateAt(policy.Policy{ScanWindows: []string{window}}, "config.validate", policy.Passive, false, policy.Requirements{}, nil, time.Now().UTC()); evaluation.Decision == policy.Deny && strings.Contains(evaluation.Reason, "invalid") {
+			errs = append(errs, fmt.Errorf("POLICY_SCAN_WINDOWS: %s", evaluation.Reason))
+		}
 	}
 	allowedStages := "sdnhkga"
 	for _, stage := range c.Recon.Pipeline {

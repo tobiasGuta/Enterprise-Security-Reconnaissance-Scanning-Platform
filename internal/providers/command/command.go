@@ -45,6 +45,7 @@ type Definition struct {
 	ScopeType                                        string
 	RetrySafe, Idempotent                            bool
 	RequiredSecrets                                  []string
+	PolicyRequirements                               policy.Requirements
 	Timeout                                          time.Duration
 	PassiveInput                                     bool
 	OutputAdapter                                    string
@@ -101,7 +102,7 @@ func New(def Definition, runner Runner, r *redaction.Redactor) *Provider {
 	return &Provider{def: def, runner: runner, redactor: r}
 }
 func (p *Provider) Manifest() capability.Manifest {
-	return capability.Manifest{Name: p.def.Name, Description: p.def.Description, Version: p.def.Version, Risk: p.def.Risk, InputSchema: json.RawMessage(`{"type":"object","additionalProperties":false,"properties":{"domain":{"type":"string"},"domains":{"type":"array","items":{"type":"string"}},"targets":{"type":"array","items":{"type":"string"}},"headless":{"type":"boolean"},"ports":{"type":"string"},"method":{"type":"string"},"target_plan_digest":{"type":"string"}}}`), OutputSchema: json.RawMessage(`{"type":"object","properties":{"lines":{"type":"array","items":{"type":"string"}},"authorized":{"type":"array"},"filtered":{"type":"array"},"warnings":{"type":"array"}}}`), RequiredScopeType: p.def.ScopeType, ApprovalRequired: p.def.Risk == policy.Moderate || p.def.Risk == policy.High, RetrySafe: p.def.RetrySafe, Idempotent: p.def.Idempotent, SupportedProviders: []string{p.def.Provider}, ProducedArtifactTypes: []string{"raw-provider-output", "normalized-json"}, RequiredSecrets: p.def.RequiredSecrets, DefaultTimeout: p.def.Timeout}
+	return capability.Manifest{Name: p.def.Name, Description: p.def.Description, Version: p.def.Version, Risk: p.def.Risk, InputSchema: json.RawMessage(`{"type":"object","additionalProperties":false,"properties":{"domain":{"type":"string"},"domains":{"type":"array","items":{"type":"string"}},"targets":{"type":"array","items":{"type":"string"}},"headless":{"type":"boolean"},"ports":{"type":"string"},"method":{"type":"string"},"target_plan_digest":{"type":"string"}}}`), OutputSchema: json.RawMessage(`{"type":"object","properties":{"lines":{"type":"array","items":{"type":"string"}},"authorized":{"type":"array"},"filtered":{"type":"array"},"warnings":{"type":"array"}}}`), RequiredScopeType: p.def.ScopeType, ApprovalRequired: p.def.Risk == policy.Moderate || p.def.Risk == policy.High, RetrySafe: p.def.RetrySafe, Idempotent: p.def.Idempotent, SupportedProviders: []string{p.def.Provider}, ProducedArtifactTypes: []string{"raw-provider-output", "normalized-json"}, RequiredSecrets: p.def.RequiredSecrets, PolicyRequirements: p.def.PolicyRequirements, DefaultTimeout: p.def.Timeout}
 }
 func (p *Provider) ValidateDefinition(raw json.RawMessage) error {
 	var in Input

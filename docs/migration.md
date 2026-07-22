@@ -8,6 +8,8 @@ Back up PostgreSQL before the first production migration. The migration requests
 
 Migration `0004_scope_target_plans.sql` adds defaulted program targeting metadata, versioned `scope_versions`, and program lineage on audit events. Existing program rows and historical workflow inputs stay readable and are not reinterpreted. Rollback is application-managed; the new tables and columns are not destructively removed.
 
+Migration `0005_policy_enforcement.sql` adds nullable artifact expiry metadata and its collection index. Existing artifact rows remain indefinite (`expires_at IS NULL`); retention applies to newly created artifacts according to the runtime policy.
+
 ## Environment and Compose
 
 Replace `RATE_LIMIT` with `NUCLEI_RATE_LIMIT` and `CONCURRENCY` with explicit host/template/headless concurrency variables. Add `DATABASE_URL` and `REDIS_PASSWORD`. Compare the complete new `.env.example`; duplicated per-binary parsers no longer exist.

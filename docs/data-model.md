@@ -10,6 +10,8 @@ Programs hold engagement identity, scope/policy references, current scope and ta
 
 Audit events preserve program scope decisions and task/run/step/tool lineage for scope loads, plan derivation, manual roots, accepted/filtered targets, exclusions, protocol/port rejection, scope changes, and moderate approvals.
 
+Artifacts carry nullable `expires_at` metadata. A null value means explicitly indefinite retention; expired content is removed from local storage before its database row is deleted, and both retention assignment and expiration are audited.
+
 Assets are stable logical identities. Asset observations describe what a capability saw during a particular successful workflow run. Endpoint identity includes host, normalized route signature, HTTP method, content type, and query-parameter names, while retaining the exact observed URL.
 
 Route signatures generalize integer, UUID, long hex/ObjectID, date/timestamp, and strong high-entropy identifier segments. They do not generalize a path merely because it has several siblings.

@@ -84,7 +84,7 @@ func TestFailedProviderAttemptPersistsToolStepArtifactsAndOriginalError(t *testi
 	store, artifacts := &capturedStore{}, &capturedArtifacts{}
 	programID, taskID, runID, stepID := domain.NewID(), domain.NewID(), domain.NewID(), domain.NewID()
 	input, _ := json.Marshal(commandprovider.Input{Targets: []string{"https://local.example.test/"}})
-	req := capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), TaskID: taskID, WorkflowRunID: runID, StepRunID: stepID, Capability: "probe.http", Input: input, IdempotencyKey: "failure-test"}, Policy: policy.Policy{AllowedCapabilities: []string{"probe.http"}}, Scope: allowedScope{}}
+	req := capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), TaskID: taskID, WorkflowRunID: runID, StepRunID: stepID, Capability: "probe.http", Input: input, IdempotencyKey: "failure-test"}, Policy: policy.Policy{AllowedCapabilities: []string{"probe.http"}, ArtifactRetention: 24 * time.Hour}, Scope: allowedScope{}}
 	result, err := (Service{Registry: registry, Store: store, Artifacts: artifacts, ProgramID: programID}).Execute(context.Background(), req)
 	if err == nil || !errors.Is(err, errFakeExit) {
 		t.Fatalf("original error was not preserved: %v", err)
@@ -105,6 +105,9 @@ func TestFailedProviderAttemptPersistsToolStepArtifactsAndOriginalError(t *testi
 	for _, req := range artifacts.requests {
 		if req.ProgramID != programID || req.TaskID != taskID || req.WorkflowRunID != runID || req.StepRunID != stepID || req.ToolRunID != store.tool.ID {
 			t.Fatalf("incomplete artifact lineage: %#v", req)
+		}
+		if req.Retention != 24*time.Hour {
+			t.Fatalf("artifact retention=%s", req.Retention)
 		}
 		switch req.Name {
 		case "stderr.txt":

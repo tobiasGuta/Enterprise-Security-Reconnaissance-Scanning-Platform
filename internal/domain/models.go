@@ -184,19 +184,20 @@ type ActionResult struct {
 	Error       *StructuredError `json:"error,omitempty"`
 }
 type Artifact struct {
-	ID              ID        `json:"id"`
-	TaskID          ID        `json:"task_id"`
-	WorkflowRunID   ID        `json:"workflow_run_id"`
-	StepRunID       ID        `json:"step_run_id"`
-	ToolRunID       ID        `json:"tool_run_id"`
-	Type            string    `json:"type"`
-	ContentType     string    `json:"content_type"`
-	Size            int64     `json:"size"`
-	SHA256          string    `json:"sha256"`
-	StorageLocation string    `json:"storage_location"`
-	CreatedAt       time.Time `json:"created_at"`
-	RedactionState  string    `json:"redaction_state"`
-	Sensitive       bool      `json:"sensitive"`
+	ID              ID         `json:"id"`
+	TaskID          ID         `json:"task_id"`
+	WorkflowRunID   ID         `json:"workflow_run_id"`
+	StepRunID       ID         `json:"step_run_id"`
+	ToolRunID       ID         `json:"tool_run_id"`
+	Type            string     `json:"type"`
+	ContentType     string     `json:"content_type"`
+	Size            int64      `json:"size"`
+	SHA256          string     `json:"sha256"`
+	StorageLocation string     `json:"storage_location"`
+	CreatedAt       time.Time  `json:"created_at"`
+	ExpiresAt       *time.Time `json:"expires_at,omitempty"`
+	RedactionState  string     `json:"redaction_state"`
+	Sensitive       bool       `json:"sensitive"`
 }
 type Asset struct {
 	ID             ID        `json:"id"`

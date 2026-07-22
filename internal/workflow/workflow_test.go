@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tobiasGuta/Reconductor/internal/budget"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
@@ -70,6 +71,14 @@ func TestDependencyValidation(t *testing.T) {
 	shell.Steps[0].Capability = "shell"
 	if err := Validate(shell, r); err == nil {
 		t.Fatal("unknown shell capability accepted")
+	}
+	crossBranch := Definition{Name: "cross-branch", Version: "1", Steps: []Step{
+		{ID: "a", Capability: "x", Input: json.RawMessage(`{}`)},
+		{ID: "b", Capability: "x", Input: json.RawMessage(`{}`)},
+		{ID: "consumer", Capability: "x", DependsOn: []string{"a"}, Input: json.RawMessage(`{"value":[]}`), Bindings: map[string]string{"value": "b.output.lines"}},
+	}}
+	if err := Validate(crossBranch, r); err == nil {
+		t.Fatal("binding from an unordered branch was accepted")
 	}
 }
 func TestRetryIdempotencyAndResume(t *testing.T) {
@@ -207,5 +216,245 @@ func TestResumeAfterDNSFailureRetainsSuccessfulScopePreparation(t *testing.T) {
 	}
 	if len(executor.dnsTargets) != 1 || executor.dnsTargets[0] != "https://authorized.example.test/" {
 		t.Fatalf("DNS step did not receive prepared authorized targets: %#v", executor.dnsTargets)
+	}
+}
+
+type parallelExecutor struct {
+	started chan string
+	release chan struct{}
+	mu      sync.Mutex
+	active  int
+	maximum int
+}
+
+func (e *parallelExecutor) Execute(ctx context.Context, req capability.Request) (capability.Result, error) {
+	var input struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(req.Action.Input, &input); err != nil {
+		return capability.Result{}, err
+	}
+	e.mu.Lock()
+	e.active++
+	if e.active > e.maximum {
+		e.maximum = e.active
+	}
+	e.mu.Unlock()
+	select {
+	case e.started <- input.Name:
+	case <-ctx.Done():
+		e.finish()
+		return capability.Result{}, ctx.Err()
+	}
+	select {
+	case <-e.release:
+		e.finish()
+		return capability.Result{Action: domain.ActionResult{RequestID: req.Action.ID, Status: "succeeded", Summary: input.Name, Output: json.RawMessage(`{"lines":[]}`)}}, nil
+	case <-ctx.Done():
+		e.finish()
+		return capability.Result{}, ctx.Err()
+	}
+}
+
+func (e *parallelExecutor) finish() {
+	e.mu.Lock()
+	e.active--
+	e.mu.Unlock()
+}
+
+func (e *parallelExecutor) maxActive() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.maximum
+}
+
+func TestIndependentBranchesRunInParallelWithDeterministicCommits(t *testing.T) {
+	calls := 0
+	registry := registryFor(t, testCap{"x", &calls, false})
+	executor := &parallelExecutor{started: make(chan string, 2), release: make(chan struct{})}
+	engine := Engine{Registry: registry, Executor: executor, MaxParallel: 2, Policy: policy.Policy{AllowedCapabilities: []string{"x"}}, Scope: allScope{}}
+	definition := Definition{ID: domain.NewID(), Name: "parallel", Version: "1", Steps: []Step{
+		{ID: "a", Capability: "x", Input: json.RawMessage(`{"name":"a"}`)},
+		{ID: "b", Capability: "x", Input: json.RawMessage(`{"name":"b"}`)},
+	}}
+	result := make(chan struct {
+		state *State
+		err   error
+	}, 1)
+	go func() {
+		state, err := engine.Run(context.Background(), definition, nil, domain.Task{ID: domain.NewID(), ProgramID: domain.NewID()}, nil)
+		result <- struct {
+			state *State
+			err   error
+		}{state, err}
+	}()
+	seen := map[string]bool{}
+	for len(seen) < 2 {
+		select {
+		case name := <-executor.started:
+			seen[name] = true
+		case <-time.After(time.Second):
+			t.Fatal("independent workflow branches did not start concurrently")
+		}
+	}
+	close(executor.release)
+	completed := <-result
+	if completed.err != nil {
+		t.Fatal(completed.err)
+	}
+	if executor.maxActive() != 2 {
+		t.Fatalf("maximum active steps = %d, want 2", executor.maxActive())
+	}
+	var succeeded []string
+	for _, event := range completed.state.Events {
+		if event.Type == "step_succeeded" {
+			succeeded = append(succeeded, event.StepID)
+		}
+	}
+	if len(succeeded) != 2 || succeeded[0] != "a" || succeeded[1] != "b" {
+		t.Fatalf("completion commits are not deterministic: %#v", succeeded)
+	}
+}
+
+func TestWorkflowProviderBudgetBoundsParallelBranches(t *testing.T) {
+	calls := 0
+	registry := registryFor(t, testCap{"x", &calls, false})
+	executor := &parallelExecutor{started: make(chan string, 2), release: make(chan struct{})}
+	limiter := budget.NewLocal(budget.Limits{Program: 2, Provider: 1, Host: 2})
+	engine := Engine{Registry: registry, Executor: executor, MaxParallel: 2, Budget: limiter, Policy: policy.Policy{AllowedCapabilities: []string{"x"}}, Scope: allScope{}}
+	definition := Definition{ID: domain.NewID(), Name: "bounded", Version: "1", Steps: []Step{
+		{ID: "a", Capability: "x", Provider: "shared", Input: json.RawMessage(`{"name":"a","target":"https://a.example.test"}`)},
+		{ID: "b", Capability: "x", Provider: "shared", Input: json.RawMessage(`{"name":"b","target":"https://b.example.test"}`)},
+	}}
+	result := make(chan error, 1)
+	go func() {
+		_, err := engine.Run(context.Background(), definition, nil, domain.Task{ID: domain.NewID(), ProgramID: domain.NewID()}, nil)
+		result <- err
+	}()
+	select {
+	case <-executor.started:
+	case <-time.After(time.Second):
+		t.Fatal("first bounded step did not start")
+	}
+	select {
+	case name := <-executor.started:
+		t.Fatalf("provider budget allowed concurrent step %s", name)
+	case <-time.After(30 * time.Millisecond):
+	}
+	executor.release <- struct{}{}
+	select {
+	case <-executor.started:
+	case <-time.After(time.Second):
+		t.Fatal("second bounded step did not start after release")
+	}
+	executor.release <- struct{}{}
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if executor.maxActive() != 1 {
+		t.Fatalf("maximum active provider steps = %d, want 1", executor.maxActive())
+	}
+}
+
+type cancellationExecutor struct {
+	started chan struct{}
+}
+
+func (e cancellationExecutor) Execute(ctx context.Context, _ capability.Request) (capability.Result, error) {
+	close(e.started)
+	<-ctx.Done()
+	return capability.Result{}, ctx.Err()
+}
+
+type cancellationPersist struct {
+	mu         sync.Mutex
+	finalSaved bool
+}
+
+func (p *cancellationPersist) Save(ctx context.Context, state *State) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if state.Run.Status == domain.RunCancelled {
+		p.finalSaved = true
+	}
+	return nil
+}
+
+func (p *cancellationPersist) savedFinalState() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.finalSaved
+}
+
+func TestControlCancellationStopsActivelyRunningStep(t *testing.T) {
+	calls := 0
+	registry := registryFor(t, testCap{"x", &calls, false})
+	executor := cancellationExecutor{started: make(chan struct{})}
+	persist := &cancellationPersist{}
+	controls := &Controls{}
+	engine := Engine{Registry: registry, Executor: executor, Persister: persist, MaxParallel: 2, Policy: policy.Policy{AllowedCapabilities: []string{"x"}}, Scope: allScope{}}
+	definition := Definition{ID: domain.NewID(), Name: "cancel", Version: "1", Steps: []Step{{ID: "active", Capability: "x", Input: json.RawMessage(`{}`)}}}
+	result := make(chan struct {
+		state *State
+		err   error
+	}, 1)
+	go func() {
+		state, err := engine.Run(context.Background(), definition, nil, domain.Task{ID: domain.NewID()}, controls)
+		result <- struct {
+			state *State
+			err   error
+		}{state, err}
+	}()
+	select {
+	case <-executor.started:
+	case <-time.After(time.Second):
+		t.Fatal("step did not start")
+	}
+	controls.Cancel()
+	select {
+	case completed := <-result:
+		if completed.err != nil {
+			t.Fatal(completed.err)
+		}
+		if completed.state.Run.Status != domain.RunCancelled || completed.state.Steps["active"].Run.Status != domain.StepCancelled {
+			t.Fatalf("unexpected cancellation state: %#v", completed.state)
+		}
+		if !persist.savedFinalState() {
+			t.Fatal("final cancellation state was not durably persisted")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active step did not stop after cancellation")
+	}
+}
+
+func TestApprovalPauseAllowsIndependentSafeBranchAndResumes(t *testing.T) {
+	calls := 0
+	registry := registryFor(t, testCap{"x", &calls, false})
+	engine := Engine{Registry: registry, Executor: registry, MaxParallel: 2, Policy: policy.Policy{AllowedCapabilities: []string{"x"}}, Scope: allScope{}}
+	definition := Definition{ID: domain.NewID(), Name: "approval-branches", Version: "1", Steps: []Step{
+		{ID: "gated", Capability: "x", ApprovalRequired: true, Input: json.RawMessage(`{}`)},
+		{ID: "safe", Capability: "x", Input: json.RawMessage(`{}`)},
+	}}
+	task := domain.Task{ID: domain.NewID()}
+	state, err := engine.Run(context.Background(), definition, nil, task, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Run.Status != domain.RunPaused || state.Steps["gated"].Run.Status != domain.StepAwaitingApproval || state.Steps["safe"].Run.Status != domain.StepSucceeded {
+		t.Fatalf("independent safe branch did not finish before approval pause: %#v", state)
+	}
+	if calls != 1 {
+		t.Fatalf("calls before approval = %d, want 1", calls)
+	}
+	engine.Approval = func(context.Context, Step, policy.Risk) (bool, error) { return true, nil }
+	state, err = engine.Run(context.Background(), definition, state, task, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Run.Status != domain.RunCompleted || state.Steps["gated"].Run.Status != domain.StepSucceeded || calls != 2 {
+		t.Fatalf("approval resume failed: calls=%d state=%#v", calls, state)
 	}
 }

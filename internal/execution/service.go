@@ -13,10 +13,11 @@ import (
 )
 
 type Service struct {
-	Registry  *capability.Registry
-	Store     ResultStore
-	Artifacts artifact.Storage
-	ProgramID domain.ID
+	Registry      *capability.Registry
+	Store         ResultStore
+	Artifacts     artifact.Storage
+	ProgramID     domain.ID
+	PolicyAuditor capability.PolicyDecisionRecorder
 }
 type ResultStore interface {
 	PreviousObservationValues(context.Context, domain.ID, domain.ID, string) ([]string, error)
@@ -24,6 +25,14 @@ type ResultStore interface {
 }
 
 func (s Service) Execute(ctx context.Context, req capability.Request) (capability.Result, error) {
+	req.ProgramID = s.ProgramID
+	req.PolicyPhase = "execution"
+	req.DecisionRecorder = s.PolicyAuditor
+	if req.DecisionRecorder == nil {
+		if recorder, ok := s.Store.(capability.PolicyDecisionRecorder); ok {
+			req.DecisionRecorder = recorder
+		}
+	}
 	if req.Action.Capability == "compare.assets" {
 		if s.Store == nil {
 			return capability.Result{}, fmt.Errorf("result store is required")
@@ -68,7 +77,7 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 			persistenceErr = errors.Join(persistenceErr, fmt.Errorf("persist %s: artifact storage is required", raw.name))
 			continue
 		}
-		a, putErr := s.Artifacts.Put(persistCtx, artifact.PutRequest{ProgramID: s.ProgramID, TaskID: req.Action.TaskID, WorkflowRunID: req.Action.WorkflowRunID, StepRunID: req.Action.StepRunID, ToolRunID: tool.ID, Type: "raw-provider-output", ContentType: raw.contentType, Name: raw.name, Data: raw.data})
+		a, putErr := s.Artifacts.Put(persistCtx, artifact.PutRequest{ProgramID: s.ProgramID, TaskID: req.Action.TaskID, WorkflowRunID: req.Action.WorkflowRunID, StepRunID: req.Action.StepRunID, ToolRunID: tool.ID, Type: "raw-provider-output", ContentType: raw.contentType, Name: raw.name, Retention: req.Policy.ArtifactRetention, Data: raw.data})
 		if putErr != nil {
 			persistenceErr = errors.Join(persistenceErr, fmt.Errorf("persist %s: %w", raw.name, putErr))
 			continue
@@ -86,7 +95,7 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 		if s.Artifacts == nil {
 			persistenceErr = errors.Join(persistenceErr, fmt.Errorf("persist result.json: artifact storage is required"))
 		} else {
-			a, putErr := s.Artifacts.Put(persistCtx, artifact.PutRequest{ProgramID: s.ProgramID, TaskID: req.Action.TaskID, WorkflowRunID: req.Action.WorkflowRunID, StepRunID: req.Action.StepRunID, ToolRunID: tool.ID, Type: "normalized-result", ContentType: "application/json", Name: "result.json", Data: result.Action.Output})
+			a, putErr := s.Artifacts.Put(persistCtx, artifact.PutRequest{ProgramID: s.ProgramID, TaskID: req.Action.TaskID, WorkflowRunID: req.Action.WorkflowRunID, StepRunID: req.Action.StepRunID, ToolRunID: tool.ID, Type: "normalized-result", ContentType: "application/json", Name: "result.json", Retention: req.Policy.ArtifactRetention, Data: result.Action.Output})
 			if putErr != nil {
 				persistenceErr = errors.Join(persistenceErr, fmt.Errorf("persist result.json: %w", putErr))
 			} else {

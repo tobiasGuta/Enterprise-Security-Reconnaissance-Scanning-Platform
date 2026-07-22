@@ -8,6 +8,8 @@ The platform does **not** contain an LLM, planner, agent loop, prompt engine, em
 
 Every network capability is checked against an explicit scope and policy before execution. Passive and low-risk capabilities may run within configured limits. Moderate and high-risk actions require the applicable approval. Forbidden actions never run. Workflow input can select a registered capability and provider; it cannot supply an executable or command array.
 
+Capability manifests also declare authentication, directory-fuzzing, cross-origin, and intrusive behavior. These restrictions and UTC scan windows are enforced at the registry immediately before provider execution and produce sanitized policy-decision audit events. Artifact retention is persisted as an expiry and collected from local storage with an audit trail.
+
 Burp-compatible scope JSON is the targeting source of truth. Exact active seeds stay separate from passive discovery roots: `*.dev.example.test` may derive the passive root `dev.example.test`, but that root is never probed unless a complete protocol/host/port/path evaluation independently authorizes it. Exclusions always win.
 
 The built-in Nuclei profile excludes denial-of-service, brute-force, fuzzing, and intrusive tags. Scanner matches are persisted as candidate findings with a default confidence, not as verified findings. Independent deterministic verification or human review is required before promotion.
@@ -89,6 +91,8 @@ go run ./cmd/platform workflow run --program-id <uuid> --scope .\scope\example.j
 ```
 
 The run pauses before the moderate Nuclei step unless the operator explicitly supplies `--approve-moderate`. Resume from the saved run state with `--resume <workflow-run-id>` and the original program/scope/plan flags. Successful unchanged steps retain their idempotency keys and are not repeated.
+
+Independent ready workflow branches execute concurrently in deterministic waves. Completion state is committed in stable graph order, and program, provider, and host concurrency budgets remain authoritative within each runner process. `platform task cancel <task-id>` propagates cancellation into an actively running local provider process.
 
 Katana headless crawling requires both `--headless` and a policy that permits it. The setting is passed to Katana rather than merely accepted by the CLI.
 
@@ -285,7 +289,7 @@ For five separate worker containers, use Compose scaling:
 docker compose up -d --scale worker=5 worker
 ```
 
-The total maximum concurrent jobs is approximately `WORKER_POOL_SIZE * worker containers`. For example, `WORKER_POOL_SIZE=5` with `--scale worker=5` can run up to 25 jobs at once. Keep Nuclei and provider limits (`NUCLEI_RATE_LIMIT`, `NUCLEI_HOST_CONCURRENCY`, `NUCLEI_TEMPLATE_CONCURRENCY`, `NUCLEI_HEADLESS_CONCURRENCY`, `RECON_RATE_LIMIT`, and `RECON_CONCURRENCY`) aligned with the authorized scope and host capacity.
+The total maximum concurrent jobs is approximately `WORKER_POOL_SIZE * worker containers`, further bounded inside each process by `POLICY_CONCURRENCY`, `POLICY_PROVIDER_CONCURRENCY`, and `POLICY_HOST_CONCURRENCY`. For example, `WORKER_POOL_SIZE=5` with `--scale worker=5` can still create capacity across five independent process budgets. Keep policy, Nuclei, and provider limits (`POLICY_RATE_LIMIT`, `NUCLEI_RATE_LIMIT`, `NUCLEI_HOST_CONCURRENCY`, `NUCLEI_TEMPLATE_CONCURRENCY`, `NUCLEI_HEADLESS_CONCURRENCY`, `RECON_RATE_LIMIT`, and `RECON_CONCURRENCY`) aligned with the authorized scope and host capacity. Cross-container global leases remain part of the future distributed workflow coordinator.
 
 ## Data and evidence
 

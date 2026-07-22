@@ -100,6 +100,27 @@ func TestAuditedProviderFlagMatrix(t *testing.T) {
 	}
 }
 
+func TestHostConcurrencyBudgetReachesHostAwareProviders(t *testing.T) {
+	input := commandprovider.Input{Targets: []string{"https://app.example.test/path"}}
+	recon := config.Recon{RateLimit: 75, Concurrency: 20}
+	pol := policy.Policy{RateLimit: 20, Concurrency: 8, HostConcurrency: 2}
+	nuclei := config.Nuclei{RateLimit: 50, HostConcurrency: 10, TemplateConcurrency: 10, HeadlessConcurrency: 2, Severity: []string{"low"}, IncludeTags: []string{"cve"}, ExcludeTags: []string{"dos"}}
+	katana, err := katanaArgs(input, pol, recon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(katana, " "); !strings.Contains(got, "-concurrency 2") {
+		t.Fatalf("Katana did not receive host budget: %s", got)
+	}
+	nucleiFlags, err := nucleiArgs(input, pol, nuclei)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(nucleiFlags, " "); !strings.Contains(got, "-bulk-size 2") {
+		t.Fatalf("Nuclei did not receive host budget: %s", got)
+	}
+}
+
 func TestDNSxInvocationRejectsInvalidURLAndKeepsLargeListsOffCommandLine(t *testing.T) {
 	if _, err := dnsxInvocation(commandprovider.Input{Targets: []string{"not-a-url"}}, policy.Policy{}); err == nil {
 		t.Fatal("invalid URL accepted")

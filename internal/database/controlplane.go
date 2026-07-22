@@ -290,7 +290,7 @@ func (s *Store) loadConsoleSteps(ctx context.Context, programID domain.ID, out *
 }
 
 func (s *Store) loadConsoleTools(ctx context.Context, programID domain.ID, out *ConsoleSnapshot) error {
-	rows, err := s.Pool.Query(ctx, `SELECT tr.id,sr.workflow_run_id,sr.step_definition_id,tr.provider,tr.tool_version,tr.sanitized_arguments,tr.started_at,tr.completed_at,tr.exit_code,tr.timed_out,(SELECT count(*) FROM artifacts a WHERE a.tool_run_id=tr.id AND a.sensitive=false) FROM tool_runs tr JOIN step_runs sr ON sr.id=tr.step_run_id JOIN workflow_runs wr ON wr.id=sr.workflow_run_id JOIN tasks t ON t.id=wr.task_id WHERE t.program_id=$1 ORDER BY tr.started_at DESC LIMIT 120`, programID)
+	rows, err := s.Pool.Query(ctx, `SELECT tr.id,sr.workflow_run_id,sr.step_definition_id,tr.provider,tr.tool_version,tr.sanitized_arguments,tr.started_at,tr.completed_at,tr.exit_code,tr.timed_out,(SELECT count(*) FROM artifacts a WHERE a.tool_run_id=tr.id AND a.sensitive=false AND (a.expires_at IS NULL OR a.expires_at>now())) FROM tool_runs tr JOIN step_runs sr ON sr.id=tr.step_run_id JOIN workflow_runs wr ON wr.id=sr.workflow_run_id JOIN tasks t ON t.id=wr.task_id WHERE t.program_id=$1 ORDER BY tr.started_at DESC LIMIT 120`, programID)
 	if err != nil {
 		return err
 	}

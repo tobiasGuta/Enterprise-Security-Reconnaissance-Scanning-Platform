@@ -16,6 +16,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/tobiasGuta/Reconductor/internal/artifact"
+	"github.com/tobiasGuta/Reconductor/internal/budget"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/config"
 	"github.com/tobiasGuta/Reconductor/internal/console"
@@ -560,8 +561,13 @@ func workflowRun(ctx context.Context, cfg config.Config, registry *capability.Re
 	if err != nil {
 		return err
 	}
-	pol := policy.Policy{ID: "runtime", AllowedCapabilities: registry.Names(), RateLimit: cfg.Policy.DefaultRateLimit, Concurrency: cfg.Policy.DefaultConcurrency, AllowedHTTPMethods: cfg.Policy.AllowedMethods, MaximumPayloadSize: cfg.Policy.MaxPayloadBytes, FollowRedirects: cfg.Policy.FollowRedirects, HeadlessBrowser: *headless, ExcludedTemplateTags: cfg.Nuclei.ExcludeTags}
-	engine := workflow.Engine{Registry: registry, Executor: execution.Service{Registry: registry, Store: s, Artifacts: artifacts, ProgramID: task.ProgramID}, Persister: database.WorkflowPersister{Store: s, File: fileStore}, Policy: pol, Scope: sc}
+	if _, err := artifact.PurgeExpired(ctx, s, artifacts, 1000); err != nil {
+		return fmt.Errorf("purge expired artifacts: %w", err)
+	}
+	pol := policy.Policy{ID: "runtime", AllowedCapabilities: registry.Names(), RateLimit: cfg.Policy.DefaultRateLimit, Concurrency: cfg.Policy.DefaultConcurrency, ProviderConcurrency: cfg.Policy.DefaultProviderConcurrency, HostConcurrency: cfg.Policy.DefaultHostConcurrency, ScanWindows: cfg.Policy.ScanWindows, AllowedHTTPMethods: cfg.Policy.AllowedMethods, AuthenticationUsage: cfg.Policy.AuthenticationUsage, HeadlessBrowser: *headless, DirectoryFuzzing: cfg.Policy.DirectoryFuzzing, MaximumPayloadSize: cfg.Policy.MaxPayloadBytes, FollowRedirects: cfg.Policy.FollowRedirects, CrossOrigin: cfg.Policy.CrossOrigin, IntrusiveChecks: cfg.Policy.IntrusiveChecks, ArtifactRetention: cfg.Policy.ArtifactRetention, ExcludedTemplateTags: cfg.Nuclei.ExcludeTags}
+	maxParallel := policy.ProgramParallelism(pol)
+	limiter := budget.NewLocal(budget.Limits{Program: maxParallel, Provider: pol.ProviderConcurrency, Host: pol.HostConcurrency})
+	engine := workflow.Engine{Registry: registry, Executor: execution.Service{Registry: registry, Store: s, Artifacts: artifacts, ProgramID: task.ProgramID}, Persister: database.WorkflowPersister{Store: s, File: fileStore}, Policy: pol, Scope: sc, Budget: limiter, MaxParallel: maxParallel}
 	approvedByRecord := false
 	if state != nil {
 		for _, ss := range state.Steps {
@@ -580,7 +586,16 @@ func workflowRun(ctx context.Context, cfg config.Config, registry *capability.Re
 	if *approve || approvedByRecord {
 		engine.Approval = func(_ context.Context, _ workflow.Step, _ policy.Risk) (bool, error) { return true, nil }
 	}
-	state, runErr := engine.Run(ctx, def, state, task, nil)
+	controls := &workflow.Controls{}
+	if task.Status == domain.TaskCancelled {
+		controls.Cancel()
+	} else if task.Status == domain.TaskPaused {
+		controls.Pause()
+	}
+	watchCtx, stopWatching := context.WithCancel(ctx)
+	defer stopWatching()
+	go watchTaskControls(watchCtx, s, task.ID, controls)
+	state, runErr := engine.Run(ctx, def, state, task, controls)
 	_ = printJSON(state)
 	if state != nil {
 		status := map[domain.RunStatus]domain.TaskStatus{domain.RunCompleted: domain.TaskCompleted, domain.RunPaused: domain.TaskPaused, domain.RunFailed: domain.TaskFailed, domain.RunCancelled: domain.TaskCancelled}[state.Run.Status]
@@ -589,6 +604,38 @@ func workflowRun(ctx context.Context, cfg config.Config, registry *capability.Re
 		}
 	}
 	return runErr
+}
+
+type taskReader interface {
+	GetTask(context.Context, domain.ID) (domain.Task, error)
+}
+
+func watchTaskControls(ctx context.Context, store taskReader, taskID domain.ID, controls *workflow.Controls) {
+	watchTaskControlsInterval(ctx, store, taskID, controls, 500*time.Millisecond)
+}
+
+func watchTaskControlsInterval(ctx context.Context, store taskReader, taskID domain.ID, controls *workflow.Controls, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			task, err := store.GetTask(ctx, taskID)
+			if err != nil {
+				slog.Warn("workflow task control refresh failed", "task_id", taskID, "error", err)
+				continue
+			}
+			switch task.Status {
+			case domain.TaskCancelled:
+				controls.Cancel()
+				return
+			case domain.TaskPaused:
+				controls.Pause()
+			}
+		}
+	}
 }
 
 func runCommand(ctx context.Context, cfg config.Config, args []string) error {

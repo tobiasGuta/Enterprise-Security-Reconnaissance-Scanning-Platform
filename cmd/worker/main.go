@@ -12,9 +12,11 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/tobiasGuta/Reconductor/internal/artifact"
+	"github.com/tobiasGuta/Reconductor/internal/budget"
 	"github.com/tobiasGuta/Reconductor/internal/config"
 	"github.com/tobiasGuta/Reconductor/internal/database"
 	"github.com/tobiasGuta/Reconductor/internal/doctor"
+	"github.com/tobiasGuta/Reconductor/internal/policy"
 	"github.com/tobiasGuta/Reconductor/internal/providers"
 	"github.com/tobiasGuta/Reconductor/internal/queue"
 	"github.com/tobiasGuta/Reconductor/internal/redaction"
@@ -63,7 +65,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	service := worker.Service{Queue: queue.New(rdb, cfg.Worker.ConsumerGroup, cfg.Worker.ConsumerName, cfg.Worker.MaxRetries, cfg.Worker.RetryBase), Registry: providers.Registry(cfg), Artifacts: artifacts, Results: store, PoolSize: cfg.Worker.PoolSize, ReadBlock: cfg.Worker.ReadBlock, LeaseTimeout: cfg.Worker.LeaseTimeout, Logger: slog.Default()}
+	workerPolicy := policy.Policy{RateLimit: cfg.Policy.DefaultRateLimit, Concurrency: cfg.Policy.DefaultConcurrency}
+	limiter := budget.NewLocal(budget.Limits{Program: policy.ProgramParallelism(workerPolicy), Provider: cfg.Policy.DefaultProviderConcurrency, Host: cfg.Policy.DefaultHostConcurrency})
+	service := worker.Service{Queue: queue.New(rdb, cfg.Worker.ConsumerGroup, cfg.Worker.ConsumerName, cfg.Worker.MaxRetries, cfg.Worker.RetryBase), Registry: providers.Registry(cfg), Artifacts: artifacts, Results: store, PoolSize: cfg.Worker.PoolSize, ReadBlock: cfg.Worker.ReadBlock, LeaseTimeout: cfg.Worker.LeaseTimeout, Logger: slog.Default(), Budget: limiter, PolicyAuditor: store, Retention: store}
 	slog.Info("worker started", "config", cfg.String())
 	return service.Run(ctx)
 }

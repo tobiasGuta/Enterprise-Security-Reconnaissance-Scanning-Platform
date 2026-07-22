@@ -10,9 +10,11 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/migrations"
 	"github.com/tobiasGuta/Reconductor/internal/normalize"
+	"github.com/tobiasGuta/Reconductor/internal/policy"
 	"github.com/tobiasGuta/Reconductor/internal/workflow"
 )
 
@@ -367,6 +369,24 @@ func (s *Store) AlreadySucceeded(ctx context.Context, key string) (bool, error) 
 	err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM step_runs WHERE idempotency_key=$1 AND status='succeeded')`, key).Scan(&ok)
 	return ok, err
 }
+
+func (s *Store) RecordPolicyDecision(ctx context.Context, record capability.PolicyDecisionRecord) error {
+	eventType := map[policy.Decision]string{policy.Allow: "policy_allowed", policy.Deny: "policy_denied", policy.RequireApproval: "policy_approval_required"}[record.Evaluation.Decision]
+	if eventType == "" {
+		eventType = "policy_decision"
+	}
+	message := "policy " + string(record.Evaluation.Decision) + " for capability " + record.Action.Capability
+	details := mustJSON(map[string]any{
+		"policy_id":    record.PolicyID,
+		"phase":        record.Phase,
+		"decision":     record.Evaluation.Decision,
+		"reason":       record.Evaluation.Reason,
+		"requirements": record.Requirements,
+	})
+	_, err := s.Pool.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,capability,provider,safe_message,details) VALUES($1,$2,'policy',$3,$4,$5,$6,$7,$8,$9,$10,$11)`, domain.NewID(), eventType, policyActor(record), optionalID(record.Action.TaskID), optionalID(record.ProgramID), optionalID(record.Action.WorkflowRunID), optionalID(record.Action.StepRunID), record.Action.Capability, record.Provider, message, details)
+	return err
+}
+
 func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step domain.StepRun, tool *domain.ToolRun, artifacts []domain.Artifact, result domain.ActionResult) error {
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
@@ -387,7 +407,11 @@ func (s *Store) PersistResult(ctx context.Context, programID domain.ID, step dom
 		}
 	}
 	for _, a := range artifacts {
-		_, err = tx.Exec(ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,storage_location,created_at,redaction_state,sensitive) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT(id) DO NOTHING`, a.ID, a.TaskID, a.WorkflowRunID, a.StepRunID, a.ToolRunID, a.Type, a.ContentType, a.Size, a.SHA256, a.StorageLocation, a.CreatedAt, a.RedactionState, a.Sensitive)
+		_, err = tx.Exec(ctx, `INSERT INTO artifacts(id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,storage_location,created_at,expires_at,redaction_state,sensitive) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT(id) DO NOTHING`, a.ID, a.TaskID, a.WorkflowRunID, a.StepRunID, a.ToolRunID, a.Type, a.ContentType, a.Size, a.SHA256, a.StorageLocation, a.CreatedAt, a.ExpiresAt, a.RedactionState, a.Sensitive)
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,tool_run_id,capability,provider,safe_message,details) VALUES($1,'artifact_retention_applied','retention','worker',$2,$3,$4,$5,$6,$7,$8,'artifact retention recorded',$9)`, domain.NewID(), a.TaskID, programID, a.WorkflowRunID, a.StepRunID, a.ToolRunID, step.Capability, providerName(tool), mustJSON(map[string]any{"artifact_id": a.ID, "expires_at": a.ExpiresAt}))
 		if err != nil {
 			return err
 		}
@@ -571,6 +595,70 @@ func providerName(t *domain.ToolRun) string {
 		return "platform"
 	}
 	return t.Provider
+}
+
+func optionalID(id domain.ID) any {
+	if id == "" {
+		return nil
+	}
+	return id
+}
+
+func policyActor(record capability.PolicyDecisionRecord) string {
+	if value := strings.TrimSpace(record.Action.RequestedBy); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(record.Phase); value != "" {
+		return value
+	}
+	return "platform"
+}
+
+func (s *Store) ExpiredArtifacts(ctx context.Context, limit int) ([]domain.Artifact, error) {
+	rows, err := s.Pool.Query(ctx, `SELECT id,task_id,workflow_run_id,step_run_id,tool_run_id,type,content_type,size,sha256,storage_location,created_at,expires_at,redaction_state,sensitive FROM artifacts WHERE expires_at IS NOT NULL AND expires_at<=now() ORDER BY expires_at,id LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []domain.Artifact{}
+	for rows.Next() {
+		var item domain.Artifact
+		if err := rows.Scan(&item.ID, &item.TaskID, &item.WorkflowRunID, &item.StepRunID, &item.ToolRunID, &item.Type, &item.ContentType, &item.Size, &item.SHA256, &item.StorageLocation, &item.CreatedAt, &item.ExpiresAt, &item.RedactionState, &item.Sensitive); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (s *Store) DeleteArtifact(ctx context.Context, id domain.ID) error {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	result, err := tx.Exec(ctx, `INSERT INTO audit_events(id,event_type,component,actor,task_id,program_id,workflow_run_id,step_run_id,tool_run_id,capability,provider,safe_message,details) SELECT $1,'artifact_expired','retention','retention',a.task_id,t.program_id,a.workflow_run_id,a.step_run_id,a.tool_run_id,tr.capability,tr.provider,'expired artifact removed',$2 FROM artifacts a JOIN tasks t ON t.id=a.task_id LEFT JOIN tool_runs tr ON tr.id=a.tool_run_id WHERE a.id=$3 AND a.expires_at IS NOT NULL AND a.expires_at<=now()`, domain.NewID(), mustJSON(map[string]any{"artifact_id": id}), id)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() == 0 {
+		return fmt.Errorf("expired artifact %s not found", id)
+	}
+	for _, statement := range []string{
+		`UPDATE tool_runs SET stdout_artifact_id=NULL WHERE stdout_artifact_id=$1`,
+		`UPDATE tool_runs SET stderr_artifact_id=NULL WHERE stderr_artifact_id=$1`,
+		`UPDATE asset_observations SET evidence_artifact_ids=array_remove(evidence_artifact_ids,$1) WHERE $1=ANY(evidence_artifact_ids)`,
+		`UPDATE candidate_findings SET evidence_artifact_ids=array_remove(evidence_artifact_ids,$1) WHERE $1=ANY(evidence_artifact_ids)`,
+		`UPDATE verification_results SET evidence_artifact_ids=array_remove(evidence_artifact_ids,$1) WHERE $1=ANY(evidence_artifact_ids)`,
+	} {
+		if _, err := tx.Exec(ctx, statement, id); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM artifacts WHERE id=$1 AND expires_at IS NOT NULL AND expires_at<=now()`, id); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) LatestChanges(ctx context.Context, programID domain.ID) (json.RawMessage, error) {

@@ -18,6 +18,7 @@ type PutRequest struct {
 	ProgramID, TaskID, WorkflowRunID, StepRunID, ToolRunID domain.ID
 	Type, ContentType, Name                                string
 	Sensitive                                              bool
+	Retention                                              time.Duration
 	Data                                                   []byte
 }
 type Storage interface {
@@ -68,7 +69,28 @@ func (l *Local) Put(_ context.Context, r PutRequest) (domain.Artifact, error) {
 		return domain.Artifact{}, err
 	}
 	sum := sha256.Sum256(data)
-	return domain.Artifact{ID: domain.NewID(), TaskID: r.TaskID, WorkflowRunID: r.WorkflowRunID, StepRunID: r.StepRunID, ToolRunID: r.ToolRunID, Type: r.Type, ContentType: r.ContentType, Size: int64(len(data)), SHA256: hex.EncodeToString(sum[:]), StorageLocation: location, CreatedAt: time.Now().UTC(), RedactionState: state, Sensitive: r.Sensitive}, nil
+	created := time.Now().UTC()
+	var expires *time.Time
+	if r.Retention > 0 {
+		value := created.Add(r.Retention)
+		expires = &value
+	}
+	return domain.Artifact{ID: domain.NewID(), TaskID: r.TaskID, WorkflowRunID: r.WorkflowRunID, StepRunID: r.StepRunID, ToolRunID: r.ToolRunID, Type: r.Type, ContentType: r.ContentType, Size: int64(len(data)), SHA256: hex.EncodeToString(sum[:]), StorageLocation: location, CreatedAt: created, ExpiresAt: expires, RedactionState: state, Sensitive: r.Sensitive}, nil
+}
+
+func (l *Local) Delete(_ context.Context, a domain.Artifact) error {
+	location, err := filepath.Abs(a.StorageLocation)
+	if err != nil {
+		return err
+	}
+	if !within(l.root, location) {
+		return fmt.Errorf("artifact path escapes storage root")
+	}
+	err = os.Remove(location)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 func within(root, target string) bool {
 	rel, err := filepath.Rel(root, target)

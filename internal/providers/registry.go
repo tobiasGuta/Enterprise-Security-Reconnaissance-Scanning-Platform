@@ -109,7 +109,7 @@ func katanaArgs(i commandprovider.Input, p policy.Policy, c config.Recon) ([]str
 	if err != nil {
 		return nil, err
 	}
-	args = append(args, "-silent", "-jsonl", "-fs", "fqdn", "-rate-limit", fmt.Sprint(bounded(c.RateLimit, p.RateLimit)), "-concurrency", fmt.Sprint(bounded(c.Concurrency, p.Concurrency)))
+	args = append(args, "-silent", "-jsonl", "-fs", "fqdn", "-rate-limit", fmt.Sprint(bounded(c.RateLimit, p.RateLimit)), "-concurrency", fmt.Sprint(bounded(c.Concurrency, hostConcurrency(p))))
 	if i.Headless {
 		args = append(args, "-headless")
 	}
@@ -132,7 +132,7 @@ func nucleiArgs(i commandprovider.Input, p policy.Policy, c config.Nuclei) ([]st
 	if err != nil {
 		return nil, err
 	}
-	args = append(args, "-jsonl", "-silent", "-dr", "-rl", fmt.Sprint(bounded(c.RateLimit, p.RateLimit)), "-c", fmt.Sprint(bounded(c.TemplateConcurrency, p.Concurrency)), "-bulk-size", fmt.Sprint(bounded(c.HostConcurrency, p.Concurrency)), "-headc", fmt.Sprint(bounded(c.HeadlessConcurrency, p.Concurrency)), "-severity", strings.Join(c.Severity, ","), "-tags", strings.Join(c.IncludeTags, ","), "-etags", strings.Join(c.ExcludeTags, ","))
+	args = append(args, "-jsonl", "-silent", "-dr", "-rl", fmt.Sprint(bounded(c.RateLimit, p.RateLimit)), "-c", fmt.Sprint(bounded(c.TemplateConcurrency, p.Concurrency)), "-bulk-size", fmt.Sprint(bounded(c.HostConcurrency, hostConcurrency(p))), "-headc", fmt.Sprint(bounded(c.HeadlessConcurrency, p.Concurrency)), "-severity", strings.Join(c.Severity, ","), "-tags", strings.Join(c.IncludeTags, ","), "-etags", strings.Join(c.ExcludeTags, ","))
 	if c.TemplateDirectory != "" {
 		args = append(args, "-t", c.TemplateDirectory)
 	}
@@ -421,4 +421,11 @@ func bounded(configured, policyLimit int) int {
 		return policyLimit
 	}
 	return configured
+}
+
+func hostConcurrency(p policy.Policy) int {
+	if p.HostConcurrency > 0 {
+		return p.HostConcurrency
+	}
+	return p.Concurrency
 }
