@@ -8,6 +8,8 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/artifact"
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/config"
+	"github.com/tobiasGuta/Reconductor/internal/console"
 	"github.com/tobiasGuta/Reconductor/internal/database"
 	"github.com/tobiasGuta/Reconductor/internal/doctor"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
@@ -78,6 +81,8 @@ func run(ctx context.Context, args []string) error {
 		return queueCommand(ctx, cfg, args[1:])
 	case "report":
 		return reportCommand(ctx, cfg, args[1:])
+	case "console":
+		return consoleCommand(ctx, cfg, args[1:])
 	case "capabilities":
 		b, _ := json.MarshalIndent(providers.Registry(cfg).Names(), "", "  ")
 		fmt.Println(string(b))
@@ -87,7 +92,51 @@ func run(ctx context.Context, args []string) error {
 	}
 }
 func usage() error {
-	return fmt.Errorf("usage: platform <migrate|program|task|scope|workflow|run|approvals|queue|report|capabilities|doctor> ...")
+	return fmt.Errorf("usage: platform <migrate|program|task|scope|workflow|run|approvals|queue|report|console|capabilities|doctor> ...")
+}
+
+func consoleCommand(ctx context.Context, cfg config.Config, args []string) error {
+	fs := flag.NewFlagSet("console", flag.ContinueOnError)
+	listen := fs.String("listen", "127.0.0.1:8088", "loopback address for the local operator console")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := requireLoopbackAddress(*listen); err != nil {
+		return err
+	}
+	store, err := readyStore(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	rdb := redisClient(cfg)
+	defer rdb.Close()
+	workQueue := queue.New(rdb, cfg.Worker.ConsumerGroup, cfg.Worker.ConsumerName, cfg.Worker.MaxRetries, cfg.Worker.RetryBase)
+	if err := workQueue.EnsureGroup(ctx); err != nil {
+		return fmt.Errorf("initialize console queue view: %w", err)
+	}
+	server := console.HTTPServer(*listen, console.New(store, workQueue))
+	slog.Info("Reconductor operator console ready", "url", "http://"+*listen)
+	err = server.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+func requireLoopbackAddress(address string) error {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil || port == "" {
+		return fmt.Errorf("console --listen must be a loopback host:port")
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("console refuses non-loopback address %q because authentication is not configured", address)
+	}
+	return nil
 }
 
 func doctorCommand(ctx context.Context, cfg config.Config, configErr error, args []string) error {

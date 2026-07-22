@@ -87,6 +87,19 @@ func TestWorkflowRunScopeDoesNotRequireDomain(t *testing.T) {
 	}
 }
 
+func TestConsoleListenAddressRequiresLoopback(t *testing.T) {
+	for _, address := range []string{"127.0.0.1:8088", "localhost:8090", "[::1]:8088"} {
+		if err := requireLoopbackAddress(address); err != nil {
+			t.Fatalf("loopback address %q rejected: %v", address, err)
+		}
+	}
+	for _, address := range []string{"0.0.0.0:8088", ":8088", "192.0.2.10:8088", "localhost"} {
+		if err := requireLoopbackAddress(address); err == nil {
+			t.Fatalf("non-loopback or invalid address %q accepted", address)
+		}
+	}
+}
+
 func captureStdout(fn func() error) (string, error) {
 	old := os.Stdout
 	r, w, err := os.Pipe()

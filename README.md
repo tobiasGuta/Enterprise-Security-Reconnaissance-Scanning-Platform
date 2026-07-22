@@ -15,7 +15,7 @@ The built-in Nuclei profile excludes denial-of-service, brute-force, fuzzing, an
 ## Architecture
 
 ```text
-Human / CLI / scheduler / future web API / future local AI
+Human / CLI / local console API / scheduler / future local AI
                            |
                     ActionRequest
                            |
@@ -210,6 +210,18 @@ go run ./cmd/platform workflow run --program-id <program-id> --scope .\scope\acm
 
 Use `--workflow authorized-web-baseline` when you only want exact active seeds from the scope file. Use the default `continuous-web-recon` workflow when you want passive discovery for derived or manually supplied roots while still enforcing the full scope evaluator before probing.
 
+### Operator console
+
+Start the local control-plane UI after PostgreSQL and Redis are available:
+
+```powershell
+go run ./cmd/platform console
+```
+
+Open `http://127.0.0.1:8088`. The console polls persisted state and presents programs and scope posture, workflow and step progress, approvals, asset changes, observations, candidate and verified findings, dead-letter recovery, sanitized provider execution metadata, and the audit stream.
+
+Approval and retry controls use explicit same-origin POST requests. The console never returns artifact storage paths, sensitive artifacts, raw provider output, or dead-letter payloads. Because remote authentication has not been added, the server refuses non-loopback listen addresses. See [operator console](docs/console.md).
+
 ## CLI
 
 ```text
@@ -221,6 +233,7 @@ platform run show|retry
 platform approvals list|approve|reject
 platform queue pending|failed|retry
 platform report changes
+platform console [--listen 127.0.0.1:8088]
 platform capabilities
 platform doctor [--format table|json]
 platform migrate
@@ -304,7 +317,7 @@ go build ./...
 
 PostgreSQL and Redis integration tests run when `TEST_DATABASE_URL` and `TEST_REDIS_ADDR` are set. All network tests use local test services; they do not contact public targets. CI runs formatting, vet, unit/integration/race tests, migrations, build, vulnerability scanning, and a worker image build.
 
-More detail: [architecture](docs/architecture.md), [workflows](docs/workflows.md), [capabilities](docs/capabilities.md), [policies](docs/policies.md), [data model](docs/data-model.md), [artifacts](docs/artifacts.md), [environment diagnostics](docs/doctor.md), [AI readiness](docs/ai-readiness.md), and [migration](docs/migration.md).
+More detail: [architecture](docs/architecture.md), [operator console](docs/console.md), [workflows](docs/workflows.md), [capabilities](docs/capabilities.md), [policies](docs/policies.md), [data model](docs/data-model.md), [artifacts](docs/artifacts.md), [environment diagnostics](docs/doctor.md), [AI readiness](docs/ai-readiness.md), and [migration](docs/migration.md).
 
 ## Current limitations
 
@@ -313,4 +326,4 @@ More detail: [architecture](docs/architecture.md), [workflows](docs/workflows.md
 - The first successful workflow run necessarily treats all observed HTTP assets as new; later runs load the previous successful HTTP observation snapshot and compare stable status/technology fields.
 - `continuous-web-recon` currently runs end to end in the local CLI. Distributed workers execute reliable individual capability jobs; a distributed workflow coordinator/scheduler is not yet included.
 - Safe verification playbooks currently evaluate independently captured response evidence. An approved HTTP evidence-acquisition capability is still needed for one-command live verification.
-- The CLI is the supported interface; a web service and scheduler have not yet been added.
+- The CLI and loopback-only operator console are supported interfaces. Remote authentication, multi-user authorization, a scheduler, and a distributed workflow coordinator have not yet been added.

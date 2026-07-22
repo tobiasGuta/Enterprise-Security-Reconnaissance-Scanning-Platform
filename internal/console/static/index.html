@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#08110f">
+  <title>Reconductor Console</title>
+  <meta name="description" content="Local operator console for deterministic, human-directed security reconnaissance.">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Primary navigation">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div><strong>Reconductor</strong><small>Operator console</small></div>
+      </div>
+      <nav class="nav-list">
+        <button class="nav-item active" data-view="overview"><span class="nav-glyph">⌂</span>Overview</button>
+        <button class="nav-item" data-view="runs"><span class="nav-glyph">↳</span>Workflow runs</button>
+        <button class="nav-item" data-view="assets"><span class="nav-glyph">◇</span>Assets</button>
+        <button class="nav-item" data-view="findings"><span class="nav-glyph">△</span>Findings</button>
+        <button class="nav-item" data-view="approvals"><span class="nav-glyph">✓</span>Approvals <span id="approval-nav-count" class="nav-count hidden">0</span></button>
+        <button class="nav-item" data-view="queue"><span class="nav-glyph">≋</span>Failed jobs <span id="queue-nav-count" class="nav-count hidden">0</span></button>
+        <button class="nav-item" data-view="logs"><span class="nav-glyph">›_</span>Provider logs</button>
+      </nav>
+      <div class="sidebar-foot">
+        <div class="connection"><span id="connection-dot" class="connection-dot"></span><div><strong id="connection-label">Connecting</strong><small>Loopback control plane</small></div></div>
+        <p>Scope, policy, and approval checks remain authoritative.</p>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <button id="mobile-menu" class="icon-button mobile-menu" aria-label="Open navigation">☰</button>
+        <div class="program-picker">
+          <label for="program-select">Active program</label>
+          <select id="program-select" aria-label="Active program"></select>
+        </div>
+        <div class="topbar-actions">
+          <span id="updated-at" class="updated-at">Waiting for data</span>
+          <button id="refresh-button" class="icon-button" aria-label="Refresh data" title="Refresh data">↻</button>
+        </div>
+      </header>
+
+      <section id="loading-state" class="state-panel">
+        <div class="scanner-line"></div>
+        <h1>Loading operational state</h1>
+        <p>Reading programs, workflow lineage, approvals, and observations.</p>
+      </section>
+
+      <section id="error-state" class="state-panel hidden" role="alert">
+        <div class="state-symbol">!</div>
+        <h1>Console data unavailable</h1>
+        <p id="error-message">The control plane could not load persisted state.</p>
+        <button id="retry-load" class="primary-button">Try again</button>
+      </section>
+
+      <section id="empty-state" class="state-panel hidden">
+        <div class="state-symbol">＋</div>
+        <h1>Create your first program</h1>
+        <p>The console is ready. Add an authorized scope through the CLI, then refresh this page.</p>
+        <code>platform program create --name example --scope scope.json</code>
+      </section>
+
+      <div id="workspace" class="workspace hidden">
+        <section class="view active" data-view-panel="overview" aria-labelledby="overview-title">
+          <div class="page-heading">
+            <div><p class="eyebrow">Current posture</p><h1 id="overview-title">Operational overview</h1><p id="overview-subtitle">One trusted view of reconnaissance activity.</p></div>
+            <div id="run-health" class="health-pill"><span></span><strong>No active run</strong></div>
+          </div>
+          <div id="metric-grid" class="metric-grid"></div>
+          <div class="overview-grid">
+            <article class="panel workflow-panel">
+              <div class="panel-heading"><div><p class="eyebrow">Latest execution</p><h2>Workflow progress</h2></div><button class="text-button" data-go-view="runs">View all runs →</button></div>
+              <div id="workflow-summary" class="workflow-summary"></div>
+              <div id="workflow-rail" class="workflow-rail"></div>
+            </article>
+            <article class="panel scope-panel">
+              <div class="panel-heading"><div><p class="eyebrow">Authorization boundary</p><h2>Current scope</h2></div><span id="scope-state" class="status-badge neutral">Recorded</span></div>
+              <div id="scope-content"></div>
+            </article>
+            <article class="panel changes-panel">
+              <div class="panel-heading"><div><p class="eyebrow">Since previous run</p><h2>Asset changes</h2></div><button class="text-button" data-go-view="assets">Explore assets →</button></div>
+              <div id="changes-content"></div>
+            </article>
+            <article class="panel approval-panel">
+              <div class="panel-heading"><div><p class="eyebrow">Human decisions</p><h2>Approval inbox</h2></div><button class="text-button" data-go-view="approvals">Open inbox →</button></div>
+              <div id="approval-preview"></div>
+            </article>
+            <article class="panel activity-panel">
+              <div class="panel-heading"><div><p class="eyebrow">Audit stream</p><h2>Recent activity</h2></div><button class="text-button" data-go-view="logs">View evidence →</button></div>
+              <div id="activity-feed" class="activity-feed"></div>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" data-view-panel="runs" aria-labelledby="runs-title">
+          <div class="page-heading"><div><p class="eyebrow">Execution lineage</p><h1 id="runs-title">Workflow runs</h1><p>Inspect live state, step outcomes, retries, and approval pauses.</p></div><div class="live-indicator"><span></span>Polling every 5 seconds</div></div>
+          <div id="runs-list" class="stack-list"></div>
+        </section>
+
+        <section class="view" data-view-panel="assets" aria-labelledby="assets-title">
+          <div class="page-heading"><div><p class="eyebrow">Observed inventory</p><h1 id="assets-title">Assets</h1><p>Stable identities and their latest persisted observations.</p></div><div class="filter-row"><select id="asset-type-filter" aria-label="Filter asset type"><option value="">All types</option></select><input id="asset-search" type="search" placeholder="Search assets" aria-label="Search assets"></div></div>
+          <div id="asset-table" class="table-wrap"></div>
+        </section>
+
+        <section class="view" data-view-panel="findings" aria-labelledby="findings-title">
+          <div class="page-heading"><div><p class="eyebrow">Evidence lifecycle</p><h1 id="findings-title">Findings</h1><p>Scanner candidates remain separate from independently verified findings.</p></div></div>
+          <div class="finding-columns"><article class="panel"><div class="panel-heading"><div><p class="eyebrow">Unverified</p><h2>Candidate findings</h2></div><span id="candidate-count" class="count-pill">0</span></div><div id="candidate-list" class="stack-list compact"></div></article><article class="panel"><div class="panel-heading"><div><p class="eyebrow">Confirmed</p><h2>Verified findings</h2></div><span id="verified-count" class="count-pill">0</span></div><div id="verified-list" class="stack-list compact"></div></article></div>
+        </section>
+
+        <section class="view" data-view-panel="approvals" aria-labelledby="approvals-title">
+          <div class="page-heading"><div><p class="eyebrow">Human authorization</p><h1 id="approvals-title">Approval inbox</h1><p>Review the reason and risk level before any gated capability proceeds.</p></div></div>
+          <div id="approval-list" class="stack-list"></div>
+        </section>
+
+        <section class="view" data-view-panel="queue" aria-labelledby="queue-title">
+          <div class="page-heading"><div><p class="eyebrow">Delivery recovery</p><h1 id="queue-title">Failed jobs</h1><p>Inspect sanitized dead-letter metadata and intentionally return jobs to the queue.</p></div><span id="pending-jobs" class="health-pill neutral">0 pending</span></div>
+          <div id="queue-list" class="stack-list"></div>
+        </section>
+
+        <section class="view" data-view-panel="logs" aria-labelledby="logs-title">
+          <div class="page-heading"><div><p class="eyebrow">Sanitized evidence</p><h1 id="logs-title">Provider logs</h1><p>Execution metadata and audit messages without raw command lines or sensitive artifacts.</p></div></div>
+          <div class="log-layout"><article class="panel"><div class="panel-heading"><div><p class="eyebrow">Tool runs</p><h2>Provider execution</h2></div></div><div id="tool-list" class="stack-list compact"></div></article><article class="panel"><div class="panel-heading"><div><p class="eyebrow">Immutable trail</p><h2>Audit events</h2></div></div><div id="audit-list" class="activity-feed long"></div></article></div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <div id="drawer-backdrop" class="backdrop hidden"></div>
+  <aside id="detail-drawer" class="detail-drawer" aria-hidden="true" aria-labelledby="drawer-title">
+    <div class="drawer-head"><div><p class="eyebrow">Run detail</p><h2 id="drawer-title">Workflow run</h2></div><button id="drawer-close" class="icon-button" aria-label="Close details">×</button></div>
+    <div id="drawer-content" class="drawer-content"></div>
+  </aside>
+
+  <div id="action-modal" class="modal-backdrop hidden" role="presentation">
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div class="modal-icon" id="modal-icon">!</div>
+      <p class="eyebrow" id="modal-eyebrow">Operator decision</p>
+      <h2 id="modal-title">Confirm action</h2>
+      <p id="modal-description"></p>
+      <dl id="modal-details" class="modal-details"></dl>
+      <div class="modal-actions"><button id="modal-cancel" class="secondary-button">Cancel</button><button id="modal-confirm" class="primary-button">Confirm</button></div>
+    </section>
+  </div>
+
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

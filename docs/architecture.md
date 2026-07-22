@@ -8,6 +8,8 @@ The application is split into commands under `cmd/` and business packages under 
 
 The local workflow runner and Redis Streams worker share that registry. Local mode provides a complete operator-driven workflow. Streams provide crash-recoverable distributed capability delivery. Results are acknowledged only after durable persistence.
 
+The loopback-only operator console is a read model and narrow mutation API over the same store and queue. It exposes persisted workflow state, scope posture, observations, finding lifecycle records, sanitized provider metadata, approvals, and dead-letter recovery without returning raw provider output, artifact paths, sensitive artifacts, or complete queued job payloads. It is not a separate execution path and cannot bypass the existing scope, policy, approval, or provider boundaries.
+
 Structured IDs correlate executions internally. The target URL is never changed to carry a task or scan identifier.
 
 The legacy aggregator is no longer required: the executor persists tool runs, artifacts, observations, candidates, and audit events transactionally. This removes a second lossy results-list hop.
