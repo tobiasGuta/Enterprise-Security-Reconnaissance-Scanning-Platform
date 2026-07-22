@@ -190,7 +190,11 @@ func (s *Service) handle(ctx context.Context, d queue.Delivery) error {
 	tool := result.ToolRun
 	if tool == nil {
 		now := time.Now().UTC()
-		tool = &domain.ToolRun{ID: domain.NewID(), StepRunID: d.Job.Action.StepRunID, Capability: d.Job.Action.Capability, Provider: "platform", ToolVersion: "1", SanitizedArguments: json.RawMessage(`{}`), ExecutionEnvironment: json.RawMessage(`{"kind":"in-process"}`), StartedAt: now, CompletedAt: &now}
+		version := "1"
+		if implementation, ok := s.Registry.Get(d.Job.Action.Capability); ok {
+			version = implementation.Manifest().Version
+		}
+		tool = &domain.ToolRun{ID: domain.NewID(), StepRunID: d.Job.Action.StepRunID, Capability: d.Job.Action.Capability, Provider: "platform", ToolVersion: version, SanitizedArguments: json.RawMessage(`{}`), ExecutionEnvironment: json.RawMessage(`{"kind":"in-process"}`), StartedAt: now, CompletedAt: &now}
 	}
 	var artifacts []domain.Artifact
 	if len(result.Action.Output) > 0 {

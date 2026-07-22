@@ -10,6 +10,8 @@ Every network capability is checked against an explicit scope and policy before 
 
 Capability manifests also declare authentication, directory-fuzzing, cross-origin, and intrusive behavior. These restrictions and UTC scan windows are enforced at the registry immediately before provider execution and produce sanitized policy-decision audit events. Artifact retention is persisted as an expiry and collected from local storage with an audit trail.
 
+Internal capabilities use the same contract discipline as command providers: concrete typed inputs and outputs, closed JSON Schemas, strict unknown-field rejection, and semantic validation during workflow-definition loading and immediately before execution.
+
 Burp-compatible scope JSON is the targeting source of truth. Exact active seeds stay separate from passive discovery roots: `*.dev.example.test` may derive the passive root `dev.example.test`, but that root is never probed unless a complete protocol/host/port/path evaluation independently authorizes it. Exclusions always win.
 
 The built-in Nuclei profile excludes denial-of-service, brute-force, fuzzing, and intrusive tags. Scanner matches are persisted as candidate findings with a default confidence, not as verified findings. Independent deterministic verification or human review is required before promotion.

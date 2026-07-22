@@ -6,8 +6,10 @@ import (
 	"testing"
 
 	"github.com/tobiasGuta/Reconductor/internal/capability"
+	"github.com/tobiasGuta/Reconductor/internal/config"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
+	"github.com/tobiasGuta/Reconductor/internal/providers"
 	platformscope "github.com/tobiasGuta/Reconductor/internal/scope"
 	"github.com/tobiasGuta/Reconductor/internal/targeting"
 	"github.com/tobiasGuta/Reconductor/internal/workflow"
@@ -17,6 +19,18 @@ type e2eCap struct{ name string }
 
 func (c e2eCap) Manifest() capability.Manifest {
 	return capability.Manifest{Name: c.name, Version: "1", Risk: map[bool]policy.Risk{true: policy.Moderate, false: policy.Low}[c.name == "scan.nuclei"], ApprovalRequired: c.name == "scan.nuclei", Idempotent: true, RetrySafe: true}
+}
+
+func TestBuiltInWorkflowSatisfiesRegisteredCapabilitySchemas(t *testing.T) {
+	cfg, err := config.LoadPlanning()
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := targeting.TargetPlan{Digest: "schema-plan", ExactActiveSeeds: []targeting.ActiveSeed{{Host: "x.test", Endpoints: []targeting.Endpoint{{Protocol: "https", Port: 443, URL: "https://x.test/"}}}}}
+	definition := ContinuousWebRecon(plan, false)
+	if err := workflow.Validate(definition, providers.Registry(cfg)); err != nil {
+		t.Fatal(err)
+	}
 }
 func (c e2eCap) Validate(context.Context, capability.Request) error { return nil }
 func (c e2eCap) Execute(_ context.Context, r capability.Request) (capability.Result, error) {

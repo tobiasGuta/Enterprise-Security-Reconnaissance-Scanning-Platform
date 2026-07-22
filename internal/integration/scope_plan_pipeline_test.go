@@ -60,7 +60,7 @@ func TestLocalScopePlanProbeFilterCompareAndReport(t *testing.T) {
 	}
 	registry := providers.Registry(cfg)
 	pol := policy.Policy{AllowedCapabilities: []string{"compare.assets", "report.changes"}}
-	compareInput, _ := json.Marshal(map[string]any{"current": []string{`{"url":"` + filtered.Authorized[0] + `","status_code":200}`}, "previous": []string{}, "coverage_complete": true})
+	compareInput, _ := json.Marshal(map[string]any{"current": []string{`{"url":"` + filtered.Authorized[0] + `","status_code":200}`}, "previous": []string{}, "coverage_complete": true, "target_plan_digest": "integration-plan"})
 	compare, err := registry.Execute(context.Background(), capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: "compare.assets", Input: compareInput}, Policy: pol, Scope: sc})
 	if err != nil {
 		t.Fatal(err)
@@ -69,7 +69,7 @@ func TestLocalScopePlanProbeFilterCompareAndReport(t *testing.T) {
 	if err := json.Unmarshal(compare.Action.Output, &changes); err != nil {
 		t.Fatal(err)
 	}
-	reportInput, _ := json.Marshal(map[string]any{"changes": changes["changes"], "endpoints": []any{}, "candidate_matches": []any{}})
+	reportInput, _ := json.Marshal(map[string]any{"changes": changes["changes"], "endpoints": []any{}, "candidate_matches": []string{}, "target_plan_digest": "integration-plan"})
 	report, err := registry.Execute(context.Background(), capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: "report.changes", Input: reportInput}, Policy: pol, Scope: sc})
 	if err != nil {
 		t.Fatal(err)

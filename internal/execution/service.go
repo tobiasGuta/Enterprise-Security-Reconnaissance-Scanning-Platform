@@ -56,7 +56,11 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 	tool := result.ToolRun
 	if tool == nil {
 		now := time.Now().UTC()
-		tool = &domain.ToolRun{ID: domain.NewID(), StepRunID: req.Action.StepRunID, Capability: req.Action.Capability, Provider: "platform", ToolVersion: "1", SanitizedArguments: json.RawMessage(`{}`), ExecutionEnvironment: json.RawMessage(`{"kind":"in-process"}`), StartedAt: now, CompletedAt: &now}
+		version := "1"
+		if implementation, ok := s.Registry.Get(req.Action.Capability); ok {
+			version = implementation.Manifest().Version
+		}
+		tool = &domain.ToolRun{ID: domain.NewID(), StepRunID: req.Action.StepRunID, Capability: req.Action.Capability, Provider: "platform", ToolVersion: version, SanitizedArguments: json.RawMessage(`{}`), ExecutionEnvironment: json.RawMessage(`{"kind":"in-process"}`), StartedAt: now, CompletedAt: &now}
 	}
 	var artifacts []domain.Artifact
 	var persistenceErr error

@@ -12,6 +12,7 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
 	commandprovider "github.com/tobiasGuta/Reconductor/internal/providers/command"
+	platformscope "github.com/tobiasGuta/Reconductor/internal/scope"
 )
 
 type testScope struct{}
@@ -28,7 +29,7 @@ func TestCompareAssetsStatusRouting(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := Registry(cfg)
-	input := json.RawMessage(`{"current":["{\"url\":\"https://x.test/ok\",\"status_code\":200}","{\"url\":\"https://x.test/login\",\"status_code\":403}","{\"url\":\"https://x.test/missing\",\"status_code\":404}"],"previous":[],"coverage_complete":true}`)
+	input := json.RawMessage(`{"current":["{\"url\":\"https://x.test/ok\",\"status_code\":200}","{\"url\":\"https://x.test/login\",\"status_code\":403}","{\"url\":\"https://x.test/missing\",\"status_code\":404}"],"previous":[],"coverage_complete":true,"target_plan_digest":"test-plan"}`)
 	result, err := r.Execute(context.Background(), capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: "compare.assets", Input: input}, Policy: policy.Policy{AllowedCapabilities: []string{"compare.assets"}}, Scope: testScope{}})
 	if err != nil {
 		t.Fatal(err)
@@ -43,6 +44,140 @@ func TestCompareAssetsStatusRouting(t *testing.T) {
 	}
 	if len(output.Crawl) != 1 || len(output.Scan) != 2 || len(output.Routes["ignored"]) != 1 {
 		t.Fatalf("unexpected routes: %s", result.Action.Output)
+	}
+}
+
+func TestInternalCapabilitiesPublishConcreteStrictSchemas(t *testing.T) {
+	cfg, err := config.LoadWith(func(k string) string {
+		if k == "DATABASE_URL" {
+			return "test"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := Registry(cfg)
+	for _, name := range []string{"targeting.prepare", "compare.assets", "classify.endpoint", "report.changes"} {
+		implementation, ok := registry.Get(name)
+		if !ok {
+			t.Fatalf("capability %s missing", name)
+		}
+		manifest := implementation.Manifest()
+		for kind, raw := range map[string]json.RawMessage{"input": manifest.InputSchema, "output": manifest.OutputSchema} {
+			if !json.Valid(raw) {
+				t.Fatalf("%s %s schema is invalid JSON: %s", name, kind, raw)
+			}
+			var schema struct {
+				AdditionalProperties *bool          `json:"additionalProperties"`
+				Required             []string       `json:"required"`
+				Properties           map[string]any `json:"properties"`
+			}
+			if err := json.Unmarshal(raw, &schema); err != nil {
+				t.Fatal(err)
+			}
+			if schema.AdditionalProperties == nil || *schema.AdditionalProperties || len(schema.Required) == 0 || len(schema.Properties) == 0 {
+				t.Fatalf("%s %s schema is not concrete and closed: %s", name, kind, raw)
+			}
+		}
+	}
+}
+
+func TestInternalCapabilitiesRejectMalformedMissingAndUnexpectedInput(t *testing.T) {
+	cfg, err := config.LoadWith(func(k string) string {
+		if k == "DATABASE_URL" {
+			return "test"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := Registry(cfg)
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{"targeting.prepare", `{"exact_urls":[],"discovered_urls":[],"ports":[],"target_plan_digest":"plan","command":"whoami"}`},
+		{"targeting.prepare", `{"exact_urls":[],"discovered_urls":[],"ports":[70000],"target_plan_digest":"plan"}`},
+		{"compare.assets", `{"current":"https://x.test","previous":[],"coverage_complete":true,"target_plan_digest":"plan"}`},
+		{"compare.assets", `{"current":[],"previous":[],"coverage_complete":true}`},
+		{"classify.endpoint", `{"active":[],"target_plan_digest":"plan"}`},
+		{"classify.endpoint", `{"active":["not a url"],"passive":[],"target_plan_digest":"plan"}`},
+		{"report.changes", `{"changes":[{"kind":"new_or_changed"}],"endpoints":[],"candidate_matches":[],"target_plan_digest":"plan"}`},
+		{"report.changes", `{"changes":[{"kind":"invented","value":"https://x.test/"}],"endpoints":[],"candidate_matches":[],"target_plan_digest":"plan"}`},
+		{"report.changes", `{"changes":[],"endpoints":[{"endpoint":{"exact_url":"https://x.test/"},"matched_keywords":["api"]}],"candidate_matches":[],"target_plan_digest":"plan"}`},
+		{"report.changes", `{"changes":[],"endpoints":[],"candidate_matches":[{}],"target_plan_digest":"plan"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name+"/"+test.raw, func(t *testing.T) {
+			if err := registry.ValidateDefinitionInput(test.name, json.RawMessage(test.raw)); err == nil {
+				t.Fatal("invalid input was accepted")
+			}
+		})
+	}
+}
+
+func TestInternalCapabilityValidDefinitionContracts(t *testing.T) {
+	cfg, err := config.LoadWith(func(k string) string {
+		if k == "DATABASE_URL" {
+			return "test"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := Registry(cfg)
+	valid := map[string]string{
+		"targeting.prepare": `{"exact_urls":[],"discovered_urls":[],"ports":[],"target_plan_digest":"plan"}`,
+		"compare.assets":    `{"current":[],"previous":[],"coverage_complete":false,"target_plan_digest":"plan"}`,
+		"classify.endpoint": `{"active":[],"passive":[],"target_plan_digest":"plan"}`,
+		"report.changes":    `{"changes":[],"endpoints":[],"candidate_matches":[],"target_plan_digest":"plan"}`,
+	}
+	for name, raw := range valid {
+		if err := registry.ValidateDefinitionInput(name, json.RawMessage(raw)); err != nil {
+			t.Fatalf("%s valid input rejected: %v", name, err)
+		}
+	}
+}
+
+func TestInternalCapabilitiesEmitTypedNonNullOutputs(t *testing.T) {
+	cfg, err := config.LoadWith(func(k string) string {
+		if k == "DATABASE_URL" {
+			return "test"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := Registry(cfg)
+	scope, err := platformscope.Compile([]platformscope.Rule{{Protocol: `^https$`, Host: `^x\.test$`, Port: `^443$`, File: `^/.*`, Enabled: true}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name  string
+		input string
+		out   any
+	}{
+		{"targeting.prepare", `{"exact_urls":["https://x.test/"],"discovered_urls":[],"ports":[443],"target_plan_digest":"plan"}`, &TargetingPrepareOutput{}},
+		{"compare.assets", `{"current":["{\"url\":\"https://x.test/\",\"status_code\":200}"],"previous":[],"coverage_complete":true,"target_plan_digest":"plan"}`, &CompareAssetsOutput{}},
+		{"classify.endpoint", `{"active":["https://x.test/api/1"],"passive":[],"target_plan_digest":"plan"}`, &ClassifyEndpointOutput{}},
+		{"report.changes", `{"changes":[],"endpoints":[],"candidate_matches":[],"target_plan_digest":"plan"}`, &ReportChangesOutput{}},
+	}
+	for _, test := range tests {
+		result, err := registry.Execute(context.Background(), capability.Request{Action: domain.ActionRequest{ID: domain.NewID(), Capability: test.name, Input: json.RawMessage(test.input)}, Policy: policy.Policy{AllowedCapabilities: []string{test.name}}, Scope: scope})
+		if err != nil {
+			t.Fatalf("%s: %v", test.name, err)
+		}
+		if strings.Contains(string(result.Action.Output), ":null") {
+			t.Fatalf("%s emitted null collection: %s", test.name, result.Action.Output)
+		}
+		if err := json.Unmarshal(result.Action.Output, test.out); err != nil {
+			t.Fatalf("%s output contract: %v", test.name, err)
+		}
 	}
 }
 
