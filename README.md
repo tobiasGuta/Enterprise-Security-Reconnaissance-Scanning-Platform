@@ -94,6 +94,87 @@ Katana headless crawling requires both `--headless` and a policy that permits it
 
 Use `--workflow authorized-web-baseline` for exact seeds only. `--discovery-root` is repeatable, passive-only, and requires `--discovery-root-reason`. Deprecated `--domain` is treated only as an auditable passive root. A detected scope expansion requires `--acknowledge-scope-expansion` after review.
 
+## Usage examples
+
+The examples below use `scope/acme.json` as a placeholder for your own Burp-compatible scope export. Replace it with the scope file you want to test.
+
+### Docker-first run
+
+Build and start the local database, Redis, and worker image:
+
+```powershell
+Copy-Item .env.example .env
+docker compose up -d --build worker
+docker compose run --rm --entrypoint /usr/local/bin/platform worker migrate
+```
+
+Check the environment without sending target traffic:
+
+```powershell
+docker compose run --rm --entrypoint /usr/local/bin/platform worker doctor
+docker compose run --rm --entrypoint /usr/local/bin/platform worker capabilities
+```
+
+Mount the local `scope` directory when running CLI commands inside Docker:
+
+```powershell
+$scopePath = "/scope/acme.json"
+$program = docker compose run --rm -v "${PWD}\scope:/scope:ro" --entrypoint /usr/local/bin/platform worker program create --name acme --platform private --scope $scopePath | ConvertFrom-Json
+$program.id
+```
+
+Review scope and workflow plans before running network steps:
+
+```powershell
+docker compose run --rm -v "${PWD}\scope:/scope:ro" --entrypoint /usr/local/bin/platform worker scope plan --scope $scopePath
+docker compose run --rm -v "${PWD}\scope:/scope:ro" --entrypoint /usr/local/bin/platform worker workflow plan --program-id $program.id --scope $scopePath
+docker compose run --rm -v "${PWD}\scope:/scope:ro" --entrypoint /usr/local/bin/platform worker workflow validate --scope $scopePath
+```
+
+Start a low-rate workflow run:
+
+```powershell
+docker compose run --rm -v "${PWD}\scope:/scope:ro" -v "${PWD}\state:/state" --entrypoint /usr/local/bin/platform worker workflow run --program-id $program.id --scope $scopePath --objective "Authorized low-rate baseline reconnaissance"
+```
+
+The default run pauses before the moderate Nuclei step. To approve that step for a run, add `--approve-moderate`:
+
+```powershell
+docker compose run --rm -v "${PWD}\scope:/scope:ro" -v "${PWD}\state:/state" --entrypoint /usr/local/bin/platform worker workflow run --program-id $program.id --scope $scopePath --objective "Authorized low-rate baseline reconnaissance" --approve-moderate
+```
+
+Show a saved run or retry/resume it:
+
+```powershell
+docker compose run --rm --entrypoint /usr/local/bin/platform worker run show <workflow-run-id>
+docker compose run --rm -v "${PWD}\scope:/scope:ro" -v "${PWD}\state:/state" --entrypoint /usr/local/bin/platform worker run retry <workflow-run-id> --program-id $program.id --scope $scopePath --approve-moderate
+```
+
+Inspect queue state and generated change reports:
+
+```powershell
+docker compose run --rm --entrypoint /usr/local/bin/platform worker queue pending
+docker compose run --rm --entrypoint /usr/local/bin/platform worker queue failed
+docker compose run --rm --entrypoint /usr/local/bin/platform worker report changes
+```
+
+### Local Go run
+
+If you have PostgreSQL, Redis, and the required provider tools installed locally, you can use the same workflow without Docker:
+
+```powershell
+Copy-Item .env.example .env
+docker compose up -d postgres redis
+go run ./cmd/platform migrate
+go run ./cmd/platform doctor
+go run ./cmd/platform capabilities
+go run ./cmd/platform program create --name acme --platform private --scope .\scope\acme.json
+go run ./cmd/platform workflow plan --program-id <program-id> --scope .\scope\acme.json
+go run ./cmd/platform workflow run --program-id <program-id> --scope .\scope\acme.json --objective "Authorized low-rate baseline reconnaissance"
+```
+
+Use `--workflow authorized-web-baseline` when you only want exact active seeds from the scope file. Use the default `continuous-web-recon` workflow when you want passive discovery for derived or manually supplied roots while still enforcing the full scope evaluator before probing.
+
 ## CLI
 
 ```text
