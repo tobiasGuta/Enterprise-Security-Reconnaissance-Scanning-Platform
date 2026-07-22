@@ -21,6 +21,7 @@ func TestWorkerDockerfilePinsMatchProviderSpecifications(t *testing.T) {
 		"ARG HTTPX_VERSION=" + HTTPXPinnedVersion,
 		"ARG KATANA_VERSION=" + KatanaPinnedVersion,
 		"ARG GAU_VERSION=" + GAUPinnedVersion,
+		"ARG PROVIDER_GO_IMAGE=golang:1.26-alpine",
 		"ARG NUCLEI_IMAGE=projectdiscovery/nuclei:" + NucleiPinnedVersion,
 		"ARG NUCLEI_TEMPLATES_VERSION=" + TemplatesPinnedVersion,
 	}

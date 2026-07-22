@@ -52,7 +52,7 @@ There are two generic scope-driven definitions: `continuous-web-recon` adds pass
 
 ## Local setup
 
-Requirements: Go 1.25+, PostgreSQL 15+, Redis 7+, and the enabled ProjectDiscovery/GAU executables on `PATH` for local workflow execution.
+Requirements: Go 1.25+, PostgreSQL 15+, Redis 7+, and the enabled ProjectDiscovery/GAU executables on `PATH` for local workflow execution. The Docker worker image builds the pinned provider binaries with Go 1.26 because ProjectDiscovery HTTPX v1.10.0 requires that newer toolchain.
 
 On systems with same-name commands, set the corresponding `*_EXECUTABLE` variable in `.env` to the full binary path. In particular, `HTTPX_EXECUTABLE` must resolve to [ProjectDiscovery HTTPX](https://docs.projectdiscovery.io/opensource/httpx/install), not the Python HTTPX client. The provider verifies ProjectDiscovery HTTPX with `-version` before probing any target.
 
@@ -124,6 +124,39 @@ platform.dead_letter
 ```
 
 Workers acknowledge only after the result, execution lineage, artifacts, observations, candidates, and audit record are durably persisted. Pending entries are reclaimed after the lease timeout. Temporary failures move through a durable retry schedule with bounded exponential backoff; exhausted or permanent failures go to the dead-letter stream. Duplicate delivery is checked using the step idempotency key.
+
+## Worker scaling
+
+Run migrations before starting workers against a fresh database:
+
+```powershell
+docker compose run --rm --entrypoint /usr/local/bin/platform worker migrate
+```
+
+There are two worker scaling knobs:
+
+- `WORKER_POOL_SIZE` controls how many jobs one worker container processes concurrently.
+- `docker compose --scale worker=N` controls how many worker containers join the Redis consumer group.
+
+For one worker container with five concurrent job handlers, set this in `.env`:
+
+```env
+WORKER_POOL_SIZE=5
+```
+
+Then start the worker service:
+
+```powershell
+docker compose up -d --build worker
+```
+
+For five separate worker containers, use Compose scaling:
+
+```powershell
+docker compose up -d --scale worker=5 worker
+```
+
+The total maximum concurrent jobs is approximately `WORKER_POOL_SIZE * worker containers`. For example, `WORKER_POOL_SIZE=5` with `--scale worker=5` can run up to 25 jobs at once. Keep Nuclei and provider limits (`NUCLEI_RATE_LIMIT`, `NUCLEI_HOST_CONCURRENCY`, `NUCLEI_TEMPLATE_CONCURRENCY`, `NUCLEI_HEADLESS_CONCURRENCY`, `RECON_RATE_LIMIT`, and `RECON_CONCURRENCY`) aligned with the authorized scope and host capacity.
 
 ## Data and evidence
 
