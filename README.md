@@ -158,6 +158,41 @@ docker compose run --rm --entrypoint /usr/local/bin/platform worker queue failed
 docker compose run --rm --entrypoint /usr/local/bin/platform worker report changes
 ```
 
+### Watch a running scan
+
+Workflow runs persist state after each step starts, succeeds, skips, pauses, or fails. To watch the latest run without relying only on Docker logs, open a second PowerShell window and tail the newest state file:
+
+```powershell
+while ($true) {
+  $latest = Get-ChildItem .\state\runs\*.json | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+  $state = Get-Content -Raw $latest.FullName | ConvertFrom-Json
+  Clear-Host
+  "Run: $($state.run.id)  Status: $($state.run.status)"
+  $state.events | Select-Object -Last 12 at,type,step_id,message | Format-Table -Auto
+  Start-Sleep 2
+}
+```
+
+For a completed or in-progress run, show the persisted workflow record:
+
+```powershell
+docker compose run --rm --entrypoint /usr/local/bin/platform worker run show <workflow-run-id>
+```
+
+To see which providers actually executed, query `tool_runs` through Postgres. This shows provider name, timing, exit code, timeout state, and sanitized arguments:
+
+```powershell
+docker compose exec postgres psql -U platform -d security_platform -c "select s.step_definition_id,t.provider,t.started_at,t.completed_at,t.exit_code,t.timed_out,t.sanitized_arguments from tool_runs t join step_runs s on s.id=t.step_run_id order by t.started_at desc limit 30;"
+```
+
+Provider stdout, stderr, and normalized result artifacts are stored under the artifact root with `Program -> Task -> WorkflowRun -> StepRun -> ToolRun` lineage. In Docker, the worker writes to the Compose artifact volume at `/data/artifacts`:
+
+```powershell
+docker compose run --rm --entrypoint /bin/sh worker -c "find /data/artifacts -path '*<workflow-run-id>*' -type f | sort"
+```
+
+The platform records sanitized tool details rather than full raw command lines with every target or secret. Use workflow state for step progress, `tool_runs` for provider execution metadata, queue commands for Redis delivery state, and artifacts for redacted provider output.
+
 ### Local Go run
 
 If you have PostgreSQL, Redis, and the required provider tools installed locally, you can use the same workflow without Docker:
