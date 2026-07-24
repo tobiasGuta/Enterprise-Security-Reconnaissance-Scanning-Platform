@@ -14,8 +14,10 @@ import (
 
 	"github.com/tobiasGuta/Reconductor/internal/capability"
 	"github.com/tobiasGuta/Reconductor/internal/domain"
+	"github.com/tobiasGuta/Reconductor/internal/intelligence"
 	"github.com/tobiasGuta/Reconductor/internal/normalize"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
+	"github.com/tobiasGuta/Reconductor/internal/provideroutput"
 	"github.com/tobiasGuta/Reconductor/internal/targeting"
 )
 
@@ -64,20 +66,18 @@ type CompareAssetsOutput struct {
 }
 
 type ClassifyEndpointInput struct {
-	Active           []string `json:"active"`
-	Passive          []string `json:"passive"`
-	TargetPlanDigest string   `json:"target_plan_digest"`
+	Active                 []string                `json:"active"`
+	Passive                []string                `json:"passive"`
+	HTTPObservations       []provideroutput.Record `json:"http_observations"`
+	CrawlObservations      []provideroutput.Record `json:"crawl_observations"`
+	PassiveObservations    []provideroutput.Record `json:"passive_observations"`
+	HistoricalObservations []provideroutput.Record `json:"historical_observations"`
+	APISchemaEndpoints     []string                `json:"api_schema_endpoints"`
+	TargetPlanDigest       string                  `json:"target_plan_digest"`
 }
 
-type InterestingEndpoint struct {
-	Endpoint        normalize.EndpointKey `json:"endpoint"`
-	MatchedKeywords []string              `json:"matched_keywords"`
-}
-
-type ClassifyEndpointOutput struct {
-	Endpoints            []normalize.EndpointKey `json:"endpoints"`
-	InterestingEndpoints []InterestingEndpoint   `json:"interesting_endpoints"`
-}
+type InterestingEndpoint = intelligence.EndpointClassification
+type ClassifyEndpointOutput = intelligence.Output
 
 type ReportChangesInput struct {
 	Changes          []AssetChange         `json:"changes"`
@@ -141,17 +141,17 @@ func (c internalCap) Execute(_ context.Context, r capability.Request) (capabilit
 
 func internalCapabilities() []capability.Capability {
 	definitions := []struct {
-		name, description string
+		name, description, version string
 		input, output     string
 	}{
-		{"targeting.prepare", "Filter and prepare scope-authorized active targets", targetingPrepareInputSchema, targetingPrepareOutputSchema},
-		{"compare.assets", "Compare current and previous HTTP asset observations", compareAssetsInputSchema, compareAssetsOutputSchema},
-		{"classify.endpoint", "Normalize and classify discovered endpoints", classifyEndpointInputSchema, classifyEndpointOutputSchema},
-		{"report.changes", "Produce a typed changes-only report", reportChangesInputSchema, reportChangesOutputSchema},
+		{"targeting.prepare", "Filter and prepare scope-authorized active targets", "2", targetingPrepareInputSchema, targetingPrepareOutputSchema},
+		{"compare.assets", "Compare current and previous HTTP asset observations", "2", compareAssetsInputSchema, compareAssetsOutputSchema},
+		{"classify.endpoint", "Classify endpoint intelligence with deterministic evidence", "3", classifyEndpointInputSchema, classifyEndpointOutputSchema},
+		{"report.changes", "Produce a typed changes-only report", "3", reportChangesInputSchema, reportChangesOutputSchema},
 	}
 	out := make([]capability.Capability, 0, len(definitions))
 	for _, definition := range definitions {
-		out = append(out, internalCap{capability.Manifest{Name: definition.name, Description: definition.description, Version: "2", Risk: policy.Passive, InputSchema: json.RawMessage(definition.input), OutputSchema: json.RawMessage(definition.output), RetrySafe: true, Idempotent: true, SupportedProviders: []string{"platform"}, DefaultTimeout: time.Minute}})
+		out = append(out, internalCap{capability.Manifest{Name: definition.name, Description: definition.description, Version: definition.version, Risk: policy.Passive, InputSchema: json.RawMessage(definition.input), OutputSchema: json.RawMessage(definition.output), RetrySafe: true, Idempotent: true, SupportedProviders: []string{"platform"}, DefaultTimeout: time.Minute}})
 	}
 	return out
 }
@@ -189,13 +189,16 @@ func validateInternalInput(name string, raw json.RawMessage) error {
 		}
 	case "classify.endpoint":
 		var input ClassifyEndpointInput
-		if err := strictInternal(raw, &input, "active", "passive", "target_plan_digest"); err != nil {
+		if err := strictInternal(raw, &input, "active", "passive", "http_observations", "crawl_observations", "passive_observations", "historical_observations", "api_schema_endpoints", "target_plan_digest"); err != nil {
 			return fmt.Errorf("classify.endpoint input: %w", err)
 		}
 		if err := requireDigest(input.TargetPlanDigest); err != nil {
 			return err
 		}
 		if err := validateObservationURLs(append(append([]string{}, input.Active...), input.Passive...)); err != nil {
+			return fmt.Errorf("classify.endpoint input: %w", err)
+		}
+		if _, err := classifyEndpoints(input); err != nil {
 			return fmt.Errorf("classify.endpoint input: %w", err)
 		}
 	case "report.changes":
@@ -313,33 +316,36 @@ func executeCompareAssets(raw json.RawMessage) (CompareAssetsOutput, string, err
 
 func executeClassifyEndpoint(raw json.RawMessage) (ClassifyEndpointOutput, string, error) {
 	var input ClassifyEndpointInput
-	if err := strictInternal(raw, &input, "active", "passive", "target_plan_digest"); err != nil {
+	if err := strictInternal(raw, &input, "active", "passive", "http_observations", "crawl_observations", "passive_observations", "historical_observations", "api_schema_endpoints", "target_plan_digest"); err != nil {
 		return ClassifyEndpointOutput{}, "", err
 	}
-	targets := append(append([]string{}, input.Active...), input.Passive...)
-	seen := map[string]bool{}
-	endpoints := []normalize.EndpointKey{}
-	interesting := []InterestingEndpoint{}
-	for _, rawTarget := range targets {
-		key, err := normalize.Endpoint(extractURL(rawTarget), "GET", "")
-		if err != nil || seen[key.Digest] {
-			continue
-		}
-		seen[key.Digest] = true
-		endpoints = append(endpoints, key)
-		matched := []string{}
-		lower := strings.ToLower(key.ExactURL)
-		for _, word := range []string{"admin", "api", "swagger", "openapi", "graphql", "oauth", "login", "token", "debug", "upload"} {
-			if strings.Contains(lower, word) {
-				matched = append(matched, word)
-			}
-		}
-		if len(matched) > 0 {
-			interesting = append(interesting, InterestingEndpoint{Endpoint: key, MatchedKeywords: matched})
-		}
+	output, err := classifyEndpoints(input)
+	if err != nil {
+		return ClassifyEndpointOutput{}, "", err
 	}
-	output := ClassifyEndpointOutput{Endpoints: endpoints, InterestingEndpoints: interesting}
-	return output, fmt.Sprintf("classified %d unique endpoints (%d interesting)", len(endpoints), len(interesting)), nil
+	return output, fmt.Sprintf("classified %d unique endpoints (%d interesting)", len(output.Endpoints), len(output.InterestingEndpoints)), nil
+}
+
+func classifyEndpoints(input ClassifyEndpointInput) (ClassifyEndpointOutput, error) {
+	crawl := append([]provideroutput.Record{}, input.CrawlObservations...)
+	crawl = append(crawl, recordsFromStrings("katana", input.Active)...)
+	passive := append([]provideroutput.Record{}, input.PassiveObservations...)
+	passive = append(passive, recordsFromStrings("gau", input.Passive)...)
+	return intelligence.Classify(intelligence.Input{
+		HTTPObservations:       input.HTTPObservations,
+		CrawlObservations:      crawl,
+		PassiveObservations:    passive,
+		HistoricalObservations: input.HistoricalObservations,
+		APISchemaEndpoints:     input.APISchemaEndpoints,
+	})
+}
+
+func recordsFromStrings(provider string, values []string) []provideroutput.Record {
+	out := make([]provideroutput.Record, 0, len(values))
+	for _, value := range values {
+		out = append(out, provideroutput.Record{Provider: provider, Kind: provideroutput.URLRecord, Target: extractURL(value), Fields: map[string]any{}})
+	}
+	return out
 }
 
 func executeReportChanges(raw json.RawMessage) (ReportChangesOutput, string, error) {
@@ -401,12 +407,29 @@ func validateInterestingEndpoint(value InterestingEndpoint) error {
 	if value.Endpoint.QueryParameters == nil {
 		return fmt.Errorf("endpoint query_parameters is required and cannot be null")
 	}
-	if len(value.MatchedKeywords) == 0 {
-		return fmt.Errorf("matched_keywords must contain at least one value")
+	if value.Labels == nil || value.MatchedKeywords == nil || value.Signals == nil || value.Sources == nil || value.Technologies == nil || value.StatusCodes == nil || value.RedirectDestinations == nil || value.Relationships == nil {
+		return fmt.Errorf("classification collections are required and cannot be null")
 	}
-	for _, keyword := range value.MatchedKeywords {
-		if strings.TrimSpace(keyword) == "" {
-			return fmt.Errorf("matched_keywords cannot contain empty values")
+	if value.InterestScore < 2 {
+		return fmt.Errorf("interesting endpoint requires interest_score of at least 2")
+	}
+	if value.Confidence < 0 || value.Confidence > 1 {
+		return fmt.Errorf("confidence must be between zero and one")
+	}
+	for index, signal := range value.Signals {
+		if strings.TrimSpace(signal.Type) == "" || strings.TrimSpace(signal.Value) == "" || strings.TrimSpace(signal.Source) == "" || signal.Weight < 0 {
+			return fmt.Errorf("signal %d requires type, value, source, and non-negative weight", index)
+		}
+	}
+	for index, relationship := range value.Relationships {
+		if _, err := normalize.URL(relationship.Source); err != nil {
+			return fmt.Errorf("relationship %d source: %w", index, err)
+		}
+		if _, err := normalize.URL(relationship.Target); err != nil {
+			return fmt.Errorf("relationship %d target: %w", index, err)
+		}
+		if strings.TrimSpace(relationship.Kind) == "" {
+			return fmt.Errorf("relationship %d kind is required", index)
 		}
 	}
 	return nil
@@ -477,8 +500,13 @@ const targetingPrepareInputSchema = `{"$schema":"https://json-schema.org/draft/2
 const targetingPrepareOutputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["urls","port_targets","filtered","accepted_count","filtered_count","target_plan_digest"],"properties":{"urls":{"type":"array","items":{"type":"string","format":"uri"}},"port_targets":{"type":"array","items":{"type":"string","format":"uri"}},"filtered":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["target","accepted","reason"],"properties":{"target":{"type":"string"},"accepted":{"type":"boolean"},"reason":{"type":"string"},"authorized_urls":{"type":"array","items":{"type":"string","format":"uri"}},"source_rule_ids":{"type":"array","items":{"type":"string"}}}}},"accepted_count":{"type":"integer","minimum":0},"filtered_count":{"type":"integer","minimum":0},"target_plan_digest":{"type":"string","minLength":1}}}`
 const compareAssetsInputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["current","previous","coverage_complete","target_plan_digest"],"properties":{"current":{"type":"array","items":{"type":"string"}},"previous":{"type":"array","items":{"type":"string"}},"coverage_complete":{"type":"boolean"},"target_plan_digest":{"type":"string","minLength":1}}}`
 const compareAssetsOutputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["new_or_changed","crawl_targets","scan_targets","status_routes","removed","changes"],"properties":{"new_or_changed":{"type":"array","items":{"type":"string","format":"uri"}},"crawl_targets":{"type":"array","items":{"type":"string","format":"uri"}},"scan_targets":{"type":"array","items":{"type":"string","format":"uri"}},"status_routes":{"type":"object","additionalProperties":false,"required":["active","redirects","authentication","ignored"],"properties":{"active":{"type":"array","items":{"type":"string","format":"uri"}},"redirects":{"type":"array","items":{"type":"string","format":"uri"}},"authentication":{"type":"array","items":{"type":"string","format":"uri"}},"ignored":{"type":"array","items":{"type":"string","format":"uri"}}}},"removed":{"type":"array","items":{"type":"string","format":"uri"}},"changes":{"type":"array","items":{"$ref":"#/$defs/change"}}},"$defs":{"change":{"type":"object","additionalProperties":false,"required":["kind","value"],"properties":{"kind":{"enum":["new_or_changed","removed"]},"value":{"type":"string","format":"uri"}}}}}`
-const classifyEndpointInputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["active","passive","target_plan_digest"],"properties":{"active":{"type":"array","items":{"type":"string"}},"passive":{"type":"array","items":{"type":"string"}},"target_plan_digest":{"type":"string","minLength":1}}}`
+const providerURLRecordSchema = `{"type":"object","additionalProperties":false,"required":["provider","kind","target"],"properties":{"provider":{"type":"string","minLength":1},"kind":{"const":"url"},"target":{"type":"string","format":"uri"},"host":{"type":"string"},"port":{"type":"integer","minimum":0,"maximum":65535},"status_code":{"type":"integer","minimum":0,"maximum":599},"technologies":{"type":"array","items":{"type":"string"}},"fields":{"type":"object"}}}`
+const classifyEndpointInputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["active","passive","http_observations","crawl_observations","passive_observations","historical_observations","api_schema_endpoints","target_plan_digest"],"properties":{"active":{"type":"array","items":{"type":"string"}},"passive":{"type":"array","items":{"type":"string"}},"http_observations":{"type":"array","items":{"$ref":"#/$defs/record"}},"crawl_observations":{"type":"array","items":{"$ref":"#/$defs/record"}},"passive_observations":{"type":"array","items":{"$ref":"#/$defs/record"}},"historical_observations":{"type":"array","items":{"$ref":"#/$defs/record"}},"api_schema_endpoints":{"type":"array","items":{"type":"string","format":"uri"}},"target_plan_digest":{"type":"string","minLength":1}},"$defs":{"record":` + providerURLRecordSchema + `}}`
 const endpointSchema = `{"type":"object","additionalProperties":false,"required":["exact_url","route_signature","method","content_type","query_parameters","digest"],"properties":{"exact_url":{"type":"string","format":"uri"},"route_signature":{"type":"string"},"method":{"type":"string"},"content_type":{"type":"string"},"query_parameters":{"type":"array","items":{"type":"string"}},"digest":{"type":"string","minLength":1}}}`
-const classifyEndpointOutputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["endpoints","interesting_endpoints"],"properties":{"endpoints":{"type":"array","items":{"$ref":"#/$defs/endpoint"}},"interesting_endpoints":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["endpoint","matched_keywords"],"properties":{"endpoint":{"$ref":"#/$defs/endpoint"},"matched_keywords":{"type":"array","items":{"type":"string"}}}}}},"$defs":{"endpoint":` + endpointSchema + `}}`
-const reportChangesInputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["changes","endpoints","candidate_matches","target_plan_digest"],"properties":{"changes":{"type":"array","items":{"$ref":"#/$defs/change"}},"endpoints":{"type":"array","items":{"$ref":"#/$defs/interesting"}},"candidate_matches":{"type":"array","items":{"type":"string","minLength":1}},"target_plan_digest":{"type":"string","minLength":1}},"$defs":{"change":{"type":"object","additionalProperties":false,"required":["kind","value"],"properties":{"kind":{"enum":["new_or_changed","removed"]},"value":{"type":"string","minLength":1}}},"interesting":{"type":"object","additionalProperties":false,"required":["endpoint","matched_keywords"],"properties":{"endpoint":` + endpointSchema + `,"matched_keywords":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}}}}}}`
+const signalSchema = `{"type":"object","additionalProperties":false,"required":["type","value","weight","source"],"properties":{"type":{"type":"string","minLength":1},"value":{"type":"string","minLength":1},"weight":{"type":"integer","minimum":0},"source":{"type":"string","minLength":1}}}`
+const relationshipSchema = `{"type":"object","additionalProperties":false,"required":["source","target","kind"],"properties":{"source":{"type":"string","format":"uri"},"target":{"type":"string","format":"uri"},"kind":{"type":"string","minLength":1}}}`
+const historicalBehaviorSchema = `{"type":"object","additionalProperties":false,"required":["seen_before","status_changed","technology_changed"],"properties":{"seen_before":{"type":"boolean"},"status_changed":{"type":"boolean"},"technology_changed":{"type":"boolean"}}}`
+const endpointClassificationSchema = `{"type":"object","additionalProperties":false,"required":["endpoint","labels","matched_keywords","signals","interest_score","confidence","sources","technologies","status_codes","redirect_destinations","relationships","historical"],"properties":{"endpoint":` + endpointSchema + `,"labels":{"type":"array","items":{"type":"string","minLength":1}},"matched_keywords":{"type":"array","items":{"type":"string","minLength":1}},"signals":{"type":"array","items":` + signalSchema + `},"interest_score":{"type":"integer","minimum":0},"confidence":{"type":"number","minimum":0,"maximum":1},"sources":{"type":"array","items":{"type":"string","minLength":1}},"technologies":{"type":"array","items":{"type":"string","minLength":1}},"status_codes":{"type":"array","items":{"type":"integer","minimum":100,"maximum":599}},"redirect_destinations":{"type":"array","items":{"type":"string","format":"uri"}},"relationships":{"type":"array","items":` + relationshipSchema + `},"historical":` + historicalBehaviorSchema + `}}`
+const classifyEndpointOutputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["endpoints","classifications","interesting_endpoints","relationships"],"properties":{"endpoints":{"type":"array","items":` + endpointSchema + `},"classifications":{"type":"array","items":` + endpointClassificationSchema + `},"interesting_endpoints":{"type":"array","items":` + endpointClassificationSchema + `},"relationships":{"type":"array","items":` + relationshipSchema + `}}}`
+const reportChangesInputSchema = `{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["changes","endpoints","candidate_matches","target_plan_digest"],"properties":{"changes":{"type":"array","items":{"$ref":"#/$defs/change"}},"endpoints":{"type":"array","items":` + endpointClassificationSchema + `},"candidate_matches":{"type":"array","items":{"type":"string","minLength":1}},"target_plan_digest":{"type":"string","minLength":1}},"$defs":{"change":{"type":"object","additionalProperties":false,"required":["kind","value"],"properties":{"kind":{"enum":["new_or_changed","removed"]},"value":{"type":"string","minLength":1}}}}}`
 const reportChangesOutputSchema = reportChangesInputSchema

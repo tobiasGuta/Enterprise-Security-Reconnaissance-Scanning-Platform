@@ -480,7 +480,7 @@ func persistObservations(ctx context.Context, tx pgx.Tx, programID domain.ID, st
 	if assetType == "" {
 		return nil
 	}
-	for _, line := range outputLines(result.Output) {
+	for _, line := range observationLines(result.Output) {
 		value := extractValue(line)
 		if value == "" {
 			continue
@@ -537,10 +537,25 @@ func outputLines(raw json.RawMessage) []string {
 	}
 	return v.Lines
 }
+func observationLines(raw json.RawMessage) []string {
+	var payload struct {
+		AuthorizedRecords []json.RawMessage `json:"authorized_records"`
+	}
+	if json.Unmarshal(raw, &payload) == nil && len(payload.AuthorizedRecords) > 0 {
+		out := make([]string, 0, len(payload.AuthorizedRecords))
+		for _, record := range payload.AuthorizedRecords {
+			if json.Valid(record) {
+				out = append(out, string(record))
+			}
+		}
+		return out
+	}
+	return outputLines(raw)
+}
 func extractValue(line string) string {
 	var v map[string]any
 	if json.Unmarshal([]byte(line), &v) == nil {
-		if s := stringField(v, "url", "input", "host", "ip", "matched-at"); s != "" {
+		if s := stringField(v, "target", "url", "input", "host", "ip", "matched-at"); s != "" {
 			return s
 		}
 	}

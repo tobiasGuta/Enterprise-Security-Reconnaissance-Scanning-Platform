@@ -49,6 +49,26 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 			}
 		}
 	}
+	if req.Action.Capability == "classify.endpoint" {
+		if s.Store == nil {
+			return capability.Result{}, fmt.Errorf("result store is required")
+		}
+		var input map[string]any
+		if err := json.Unmarshal(req.Action.Input, &input); err == nil {
+			if previous, ok := input["historical_observations"].([]any); !ok || len(previous) == 0 {
+				values, loadErr := s.Store.PreviousObservationValues(ctx, s.ProgramID, req.Action.WorkflowRunID, "probe.http")
+				if loadErr != nil {
+					return capability.Result{}, loadErr
+				}
+				history, historyErr := historicalRecords(values)
+				if historyErr != nil {
+					return capability.Result{}, historyErr
+				}
+				input["historical_observations"] = history
+				req.Action.Input, _ = json.Marshal(input)
+			}
+		}
+	}
 	result, executionErr := s.Registry.Execute(ctx, req)
 	if executionErr != nil && result.Action.Error == nil {
 		result.Action = domain.ActionResult{RequestID: req.Action.ID, Status: "failed", Summary: "capability execution failed", Error: &domain.StructuredError{Classification: "execution", Message: executionErr.Error(), Retryable: false}}
@@ -130,4 +150,24 @@ func (s Service) Execute(ctx context.Context, req capability.Request) (capabilit
 		return result, errors.Join(executionErr, fmt.Errorf("persist execution result: %w", persistenceErr))
 	}
 	return result, executionErr
+}
+
+func historicalRecords(values []string) ([]any, error) {
+	out := make([]any, 0, len(values))
+	for index, value := range values {
+		var item map[string]any
+		if err := json.Unmarshal([]byte(value), &item); err != nil {
+			return nil, fmt.Errorf("historical observation %d: %w", index, err)
+		}
+		if target, _ := item["target"].(string); target != "" {
+			out = append(out, item)
+			continue
+		}
+		legacy, _ := item["value"].(string)
+		if legacy == "" {
+			return nil, fmt.Errorf("historical observation %d has no target", index)
+		}
+		out = append(out, map[string]any{"provider": "historical", "kind": "url", "target": legacy, "fields": map[string]any{}})
+	}
+	return out, nil
 }

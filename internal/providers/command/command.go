@@ -199,8 +199,8 @@ func (p *Provider) Execute(ctx context.Context, req capability.Request) (capabil
 			return capability.Result{}, fmt.Errorf("provider %s requires detailed scope evaluation", p.def.Provider)
 		}
 		batch := provideroutput.Parse(p.def.OutputAdapter, lines)
-		accepted, authorizedURLs, filtered := filterRecords(detailed, batch.Records)
-		normalized = map[string]any{"lines": accepted, "authorized": accepted, "authorized_urls": authorizedURLs, "filtered": filtered, "records": batch.Records, "warnings": batch.Warnings, "accepted_count": len(accepted), "filtered_count": len(filtered)}
+		accepted, authorizedURLs, authorizedRecords, filtered := filterRecords(detailed, batch.Records)
+		normalized = map[string]any{"lines": accepted, "authorized": accepted, "authorized_urls": authorizedURLs, "authorized_records": authorizedRecords, "filtered": filtered, "records": batch.Records, "warnings": batch.Warnings, "accepted_count": len(accepted), "filtered_count": len(filtered)}
 		lines = accepted
 	}
 	output, _ := json.Marshal(normalized)
@@ -320,9 +320,10 @@ func validatePassiveRoot(raw string) error {
 	return nil
 }
 
-func filterRecords(sc targeting.DetailedScope, records []provideroutput.Record) ([]string, []string, []targeting.FilterDecision) {
+func filterRecords(sc targeting.DetailedScope, records []provideroutput.Record) ([]string, []string, []provideroutput.Record, []targeting.FilterDecision) {
 	accepted := []string{}
 	authorizedURLs := []string{}
+	authorizedRecords := []provideroutput.Record{}
 	filtered := []targeting.FilterDecision{}
 	for _, record := range records {
 		switch record.Kind {
@@ -331,6 +332,7 @@ func filterRecords(sc targeting.DetailedScope, records []provideroutput.Record) 
 			if len(r.Authorized) > 0 {
 				accepted = append(accepted, r.Authorized...)
 				authorizedURLs = append(authorizedURLs, r.AuthorizedURLs...)
+				authorizedRecords = append(authorizedRecords, record)
 			} else {
 				filtered = append(filtered, r.Filtered...)
 			}
@@ -339,6 +341,7 @@ func filterRecords(sc targeting.DetailedScope, records []provideroutput.Record) 
 			if len(r.Authorized) > 0 {
 				accepted = append(accepted, r.Authorized...)
 				authorizedURLs = append(authorizedURLs, r.AuthorizedURLs...)
+				authorizedRecords = append(authorizedRecords, record)
 			} else {
 				filtered = append(filtered, r.Filtered...)
 			}
@@ -362,6 +365,7 @@ func filterRecords(sc targeting.DetailedScope, records []provideroutput.Record) 
 				if value == record.Port {
 					matched = true
 					accepted = append(accepted, record.Target)
+					authorizedRecords = append(authorizedRecords, record)
 					break
 				}
 			}
@@ -378,7 +382,10 @@ func filterRecords(sc targeting.DetailedScope, records []provideroutput.Record) 
 	accepted = dedupe(accepted)
 	sort.Strings(authorizedURLs)
 	authorizedURLs = dedupe(authorizedURLs)
-	return accepted, authorizedURLs, filtered
+	sort.SliceStable(authorizedRecords, func(i, j int) bool {
+		return authorizedRecords[i].Target < authorizedRecords[j].Target
+	})
+	return accepted, authorizedURLs, authorizedRecords, filtered
 }
 func scopeReason(value string) platformscope.Reason { return platformscope.Reason(value) }
 func dedupe(items []string) []string {

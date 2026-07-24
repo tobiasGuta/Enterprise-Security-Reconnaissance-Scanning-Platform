@@ -12,6 +12,7 @@ import (
 	"github.com/tobiasGuta/Reconductor/internal/domain"
 	"github.com/tobiasGuta/Reconductor/internal/policy"
 	"github.com/tobiasGuta/Reconductor/internal/providercheck"
+	"github.com/tobiasGuta/Reconductor/internal/provideroutput"
 	"github.com/tobiasGuta/Reconductor/internal/redaction"
 	platformscope "github.com/tobiasGuta/Reconductor/internal/scope"
 )
@@ -77,10 +78,12 @@ func TestPassiveDiscoveryOutputIsFilteredPerRecordBeforeActiveUse(t *testing.T) 
 		t.Fatal(err)
 	}
 	var output struct {
-		Authorized     []string         `json:"authorized"`
-		AuthorizedURLs []string         `json:"authorized_urls"`
-		Filtered       []map[string]any `json:"filtered"`
-		Warnings       []map[string]any `json:"warnings"`
+		Authorized        []string                `json:"authorized"`
+		AuthorizedURLs    []string                `json:"authorized_urls"`
+		AuthorizedRecords []provideroutput.Record `json:"authorized_records"`
+		Records           []provideroutput.Record `json:"records"`
+		Filtered          []map[string]any        `json:"filtered"`
+		Warnings          []map[string]any        `json:"warnings"`
 	}
 	if err := json.Unmarshal(result.Action.Output, &output); err != nil {
 		t.Fatal(err)
@@ -90,6 +93,12 @@ func TestPassiveDiscoveryOutputIsFilteredPerRecordBeforeActiveUse(t *testing.T) 
 	}
 	if len(output.AuthorizedURLs) != 1 || output.AuthorizedURLs[0] != "https://authorized.dev.example.com/" {
 		t.Fatalf("urls=%v", output.AuthorizedURLs)
+	}
+	if len(output.AuthorizedRecords) != 1 || output.AuthorizedRecords[0].Target != "authorized.dev.example.com" {
+		t.Fatalf("authorized records leaked filtered data: %#v", output.AuthorizedRecords)
+	}
+	if len(output.Records) != 3 {
+		t.Fatalf("raw normalized records=%#v", output.Records)
 	}
 	if len(output.Filtered) != 2 || len(output.Warnings) != 1 {
 		t.Fatalf("filtered=%v warnings=%v", output.Filtered, output.Warnings)
