@@ -1246,10 +1246,10 @@ sequenceDiagram
 
 ---
 
-    ## 16. End-to-end journey: human-led authorization investigation
+## 16. End-to-end journey: human-led authorization investigation
 
-    ```mermaid
-    sequenceDiagram
+```mermaid
+sequenceDiagram
     participant U as Researcher
     participant R as Reconductor
     participant A as AI partner
@@ -1271,7 +1271,7 @@ sequenceDiagram
     U->>R: Confirm impact and mark vulnerability
     R->>R: Create verified finding and update coverage
     R-->>U: Generate report draft and evidence bundle
-    ```
+```
 
 ---
 
